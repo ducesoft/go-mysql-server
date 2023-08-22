@@ -221,7 +221,7 @@ func (r *indexAnalyzer) ExpressionsWithIndexes(db string, exprs ...sql.Expressio
 		for _, idx := range idxes {
 			var used = make(map[int]struct{})
 			var matched []sql.Expression
-			for _, ie := range idx.Expressions() {
+			for _, ie := range Expressions(idx, exprs...) {
 				var found bool
 				for i, e := range exprs {
 					if _, ok := used[i]; ok {
