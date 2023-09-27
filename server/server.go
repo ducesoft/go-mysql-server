@@ -29,6 +29,25 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 )
 
+// ProtocolListener handles connections based on the configuration it was given. These listeners also implement
+// their own protocol, which by default will be the MySQL wire protocol, but another protocol may be provided.
+type ProtocolListener interface {
+	Addr() net.Addr
+	Accept()
+	Close()
+}
+
+// ProtocolListenerFunc returns a ProtocolListener based on the configuration it was given.
+type ProtocolListenerFunc func(cfg mysql.ListenerConfig) (ProtocolListener, error)
+
+// DefaultProtocolListenerFunc is the protocol listener, which defaults to Vitess' protocol listener. Changing
+// this function will change the protocol listener used when creating all servers. If multiple servers are needed
+// with different protocols, then create each server after changing this function. Servers retain the protocol that
+// they were created with.
+var DefaultProtocolListenerFunc ProtocolListenerFunc = func(cfg mysql.ListenerConfig) (ProtocolListener, error) {
+	return mysql.NewListenerWithConfig(cfg)
+}
+
 type ServerEventListener interface {
 	ClientConnected()
 	ClientDisconnected()
@@ -145,19 +164,21 @@ func newServerFromHandler(cfg Config, e *sqle.Engine, sm *SessionManager, handle
 		ConnReadBufferSize:       mysql.DefaultConnBufferSize,
 		AllowClearTextWithoutTLS: cfg.AllowClearTextWithoutTLS,
 	}
-	vtListnr, err := mysql.NewListenerWithConfig(listenerCfg)
+	protocolListener, err := DefaultProtocolListenerFunc(listenerCfg)
 	if err != nil {
 		return nil, err
 	}
 
-	if cfg.Version != "" {
-		vtListnr.ServerVersion = cfg.Version
+	if vtListener, ok := protocolListener.(*mysql.Listener); ok {
+		if cfg.Version != "" {
+			vtListener.ServerVersion = cfg.Version
+		}
+		vtListener.TLSConfig = cfg.TLSConfig
+		vtListener.RequireSecureTransport = cfg.RequireSecureTransport
 	}
-	vtListnr.TLSConfig = cfg.TLSConfig
-	vtListnr.RequireSecureTransport = cfg.RequireSecureTransport
 
 	return &Server{
-		Listener:   vtListnr,
+		Listener:   protocolListener,
 		handler:    handler,
 		sessionMgr: sm,
 		Engine:     e,
@@ -167,8 +188,20 @@ func newServerFromHandler(cfg Config, e *sqle.Engine, sm *SessionManager, handle
 // Start starts accepting connections on the server.
 func (s *Server) Start() error {
 	logrus.Infof("Server ready. Accepting connections.")
+	s.WarnIfLoadFileInsecure()
 	s.Listener.Accept()
 	return nil
+}
+
+func (s *Server) WarnIfLoadFileInsecure() {
+	_, v, ok := sql.SystemVariables.GetGlobal("secure_file_priv")
+	if ok {
+		if v == "" {
+			logrus.Warn("secure_file_priv is set to \"\", which is insecure.")
+			logrus.Warn("Any user with GRANT FILE privileges will be able to read any file which the sql-server process can read.")
+			logrus.Warn("Please consider restarting the server with secure_file_priv set to a safe (or non-existant) directory.")
+		}
+	}
 }
 
 // Close closes the server connection.

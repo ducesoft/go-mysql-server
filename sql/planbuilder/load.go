@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -46,17 +60,20 @@ func (b *Builder) buildLoad(inScope *scope, d *ast.Load) (outScope *scope) {
 		ignoreNumVal = b.getInt64Value(inScope, d.IgnoreNum, "Cannot parse ignore Value")
 	}
 
-	ld := plan.NewLoadData(bool(d.Local), d.Infile, destScope.node, columnsToStrings(d.Columns), d.Fields, d.Lines, ignoreNumVal, d.IgnoreOrReplace)
-
-	outScope = inScope.push()
-	ins := plan.NewInsertInto(db, destScope.node, ld, ld.IsReplace, ld.ColumnNames, nil, ld.IsIgnore)
-
+	dest := destScope.node
+	sch := dest.Schema()
 	if rt != nil {
-		checks := b.loadChecksFromTable(destScope, rt.Table)
-		ins.Checks = checks
+		sch = b.resolveSchemaDefaults(destScope, rt.Schema())
 	}
 
-	outScope.node = ins
+	ld := plan.NewLoadData(bool(d.Local), d.Infile, sch, columnsToStrings(d.Columns), d.Fields, d.Lines, ignoreNumVal, d.IgnoreOrReplace)
+	outScope = inScope.push()
+	ins := plan.NewInsertInto(db, plan.NewInsertDestination(sch, dest), ld, ld.IsReplace, ld.ColumnNames, nil, ld.IsIgnore)
 
+	outScope.node = ins
+	if rt != nil {
+		checks := b.loadChecksFromTable(destScope, rt.Table)
+		outScope.node = ins.WithChecks(checks)
+	}
 	return outScope
 }

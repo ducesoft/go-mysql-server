@@ -23,6 +23,10 @@ import (
 
 var InfoSchemaQueries = []QueryTest{
 	{
+		Query:    "SHOW KEYS FROM `columns` FROM `information_schema`;",
+		Expected: []sql.Row{},
+	},
+	{
 		Query: `SELECT 
      table_name, index_name, comment, non_unique, GROUP_CONCAT(column_name ORDER BY seq_in_index) AS COLUMNS 
    FROM information_schema.statistics 
@@ -1078,7 +1082,7 @@ FROM INFORMATION_SCHEMA.TRIGGERS WHERE trigger_schema = 'mydb'`,
 				Expected: []sql.Row{
 					{"ptable", "id", "NO", "int", "int", "PRI"},
 					{"ptable", "id2", "NO", "int", "int", "UNI"},
-					{"ptable", "col1", "YES", "tinyint", "tinyint", ""},
+					{"ptable", "col1", "YES", "tinyint", "tinyint(1)", ""},
 				},
 			},
 		},

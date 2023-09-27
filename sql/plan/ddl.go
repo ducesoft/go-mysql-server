@@ -19,9 +19,9 @@ import (
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/go-mysql-server/sql/transform"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/fulltext"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
@@ -152,7 +152,7 @@ type CreateTable struct {
 	ifNotExists  IfNotExistsOption
 	FkDefs       []*sql.ForeignKeyConstraint
 	fkParentTbls []sql.ForeignKeyTable
-	ChDefs       sql.CheckConstraints
+	checks       sql.CheckConstraints
 	IdxDefs      []*IndexDefinition
 	Collation    sql.CollationID
 	like         sql.Node
@@ -164,6 +164,7 @@ var _ sql.Databaser = (*CreateTable)(nil)
 var _ sql.Node = (*CreateTable)(nil)
 var _ sql.Expressioner = (*CreateTable)(nil)
 var _ sql.SchemaTarget = (*CreateTable)(nil)
+var _ sql.CheckConstraintNode = (*CreateTable)(nil)
 var _ sql.CollationCoercible = (*CreateTable)(nil)
 
 // NewCreateTable creates a new CreateTable node
@@ -177,7 +178,7 @@ func NewCreateTable(db sql.Database, name string, ifn IfNotExistsOption, temp Te
 		name:         name,
 		CreateSchema: tableSpec.Schema,
 		FkDefs:       tableSpec.FkDefs,
-		ChDefs:       tableSpec.ChDefs,
+		checks:       tableSpec.ChDefs,
 		IdxDefs:      tableSpec.IdxDefs,
 		Collation:    tableSpec.Collation,
 		ifNotExists:  ifn,
@@ -206,13 +207,23 @@ func NewCreateTableSelect(db sql.Database, name string, selectNode sql.Node, tab
 		ddlNode:      ddlNode{Db: db},
 		CreateSchema: tableSpec.Schema,
 		FkDefs:       tableSpec.FkDefs,
-		ChDefs:       tableSpec.ChDefs,
+		checks:       tableSpec.ChDefs,
 		IdxDefs:      tableSpec.IdxDefs,
 		name:         name,
 		selectNode:   selectNode,
 		ifNotExists:  ifn,
 		temporary:    temp,
 	}
+}
+
+func (c *CreateTable) Checks() sql.CheckConstraints {
+	return c.checks
+}
+
+func (c *CreateTable) WithChecks(checks sql.CheckConstraints) sql.Node {
+	ret := *c
+	ret.checks = checks
+	return &ret
 }
 
 // WithTargetSchema  implements the sql.TargetSchema interface.
@@ -247,7 +258,7 @@ func (c *CreateTable) Resolved() bool {
 		return false
 	}
 
-	for _, chDef := range c.ChDefs {
+	for _, chDef := range c.checks {
 		if !chDef.Expr.Resolved() {
 			return false
 		}
@@ -260,6 +271,10 @@ func (c *CreateTable) Resolved() bool {
 	}
 
 	return true
+}
+
+func (c *CreateTable) IsReadOnly() bool {
+	return false
 }
 
 // ForeignKeys returns any foreign keys that will be declared on this table.
@@ -390,7 +405,7 @@ func (c *CreateTable) CreateChecks(ctx *sql.Context, tableNode sql.Table) error 
 		return ErrNoCheckConstraintSupport.New(c.name)
 	}
 
-	for _, ch := range c.ChDefs {
+	for _, ch := range c.checks {
 		check, err := NewCheckDefinition(ctx, ch)
 		if err != nil {
 			return err
@@ -481,7 +496,7 @@ func (c *CreateTable) DebugString() string {
 	if len(c.IdxDefs) > 0 {
 		children = append(children, c.indexesDebugString())
 	}
-	if len(c.ChDefs) > 0 {
+	if len(c.checks) > 0 {
 		children = append(children, c.checkConstraintsDebugString())
 	}
 
@@ -515,7 +530,7 @@ func (c *CreateTable) checkConstraintsDebugString() string {
 	p := sql.NewTreePrinter()
 	p.WriteNode("CheckConstraints")
 	var children []string
-	for _, def := range c.ChDefs {
+	for _, def := range c.checks {
 		children = append(children, sql.DebugString(def))
 	}
 	p.WriteChildren(children...)
@@ -534,16 +549,12 @@ func (c *CreateTable) schemaDebugString() string {
 }
 
 func (c *CreateTable) Expressions() []sql.Expression {
-	exprs := make([]sql.Expression, len(c.CreateSchema.Schema)+len(c.ChDefs))
-	i := 0
-	for _, col := range c.CreateSchema.Schema {
-		exprs[i] = expression.WrapExpression(col.Default)
-		i++
+	exprs := transform.WrappedColumnDefaults(c.CreateSchema.Schema)
+
+	for _, ch := range c.checks {
+		exprs = append(exprs, ch.Expr)
 	}
-	for _, ch := range c.ChDefs {
-		exprs[i] = ch.Expr
-		i++
-	}
+
 	return exprs
 }
 
@@ -561,7 +572,7 @@ func (c *CreateTable) TableSpec() *TableSpec {
 	ret := tableSpec.WithSchema(c.CreateSchema)
 	ret = ret.WithForeignKeys(c.FkDefs)
 	ret = ret.WithIndices(c.IdxDefs)
-	ret = ret.WithCheckConstraints(c.ChDefs)
+	ret = ret.WithCheckConstraints(c.checks)
 	ret.Collation = c.Collation
 
 	return ret
@@ -580,7 +591,8 @@ func (c *CreateTable) Temporary() TempTableOption {
 }
 
 func (c CreateTable) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
-	length := len(c.CreateSchema.Schema) + len(c.ChDefs)
+	schemaLen := len(c.CreateSchema.Schema)
+	length := schemaLen + len(c.checks)
 	if len(exprs) != length {
 		return nil, sql.ErrInvalidChildrenNumber.New(c, len(exprs), length)
 	}
@@ -588,24 +600,19 @@ func (c CreateTable) WithExpressions(exprs ...sql.Expression) (sql.Node, error) 
 	nc := c
 
 	// Make sure to make a deep copy of any slices here so we aren't modifying the original pointer
-	ns := c.CreateSchema.Schema.Copy()
-	i := 0
-	for ; i < len(c.CreateSchema.Schema); i++ {
-		unwrappedColDefVal, ok := exprs[i].(*expression.Wrapper).Unwrap().(*sql.ColumnDefaultValue)
-		if ok {
-			ns[i].Default = unwrappedColDefVal
-		} else { // nil fails type check
-			ns[i].Default = nil
-		}
-	}
-	nc.CreateSchema = sql.NewPrimaryKeySchema(ns, c.CreateSchema.PkOrdinals...)
-
-	ncd, err := c.ChDefs.FromExpressions(exprs[i:])
+	ns, err := transform.SchemaWithDefaults(c.CreateSchema.Schema, exprs[:schemaLen])
 	if err != nil {
 		return nil, err
 	}
 
-	nc.ChDefs = ncd
+	nc.CreateSchema = sql.NewPrimaryKeySchema(ns, c.CreateSchema.PkOrdinals...)
+
+	ncd, err := c.checks.FromExpressions(exprs[schemaLen:])
+	if err != nil {
+		return nil, err
+	}
+
+	nc.checks = ncd
 	return &nc, nil
 }
 
@@ -682,6 +689,10 @@ func (d *DropTable) Resolved() bool {
 	}
 
 	return true
+}
+
+func (d *DropTable) IsReadOnly() bool {
+	return false
 }
 
 // Schema implements the sql.Expression interface.

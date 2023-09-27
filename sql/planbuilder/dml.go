@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -55,6 +69,10 @@ func (b *Builder) buildInsert(inScope *scope, i *ast.Insert) (outScope *scope) {
 			schema := rt.Schema()
 			columns = make([]string, len(schema))
 			for i, col := range schema {
+				// Tables with any generated column must always supply a column list, so this is always an error
+				if col.Generated != nil {
+					b.handleErr(sql.ErrGeneratedColumnValue.New(col.Name, rt.Name()))
+				}
 				columns[i] = col.Name
 			}
 		}
@@ -65,6 +83,8 @@ func (b *Builder) buildInsert(inScope *scope, i *ast.Insert) (outScope *scope) {
 	}
 	srcScope := b.insertRowsToNode(inScope, i.Rows, columns, sch)
 
+	// TODO: on duplicate expressions need to reference both VALUES and
+	//  derived columns equally in ON DUPLICATE UPDATE expressions.
 	combinedScope := inScope.replace()
 	for i, c := range destScope.cols {
 		combinedScope.newColumn(c)
@@ -86,15 +106,13 @@ func (b *Builder) buildInsert(inScope *scope, i *ast.Insert) (outScope *scope) {
 
 	dest := destScope.node
 
-	ins := plan.NewInsertInto(db, plan.NewInsertDestination(dest.Schema(), dest), srcScope.node, isReplace, columns, onDupExprs, ignore)
-
-	if rt != nil {
-		checks := b.loadChecksFromTable(destScope, rt.Table)
-		ins.Checks = checks
-	}
-
+	ins := plan.NewInsertInto(db, plan.NewInsertDestination(sch, dest), srcScope.node, isReplace, columns, onDupExprs, ignore)
 	outScope = destScope
 	outScope.node = ins
+	if rt != nil {
+		checks := b.loadChecksFromTable(destScope, rt.Table)
+		outScope.node = ins.WithChecks(checks)
+	}
 
 	return
 }
@@ -124,6 +142,9 @@ func (b *Builder) buildInsertValues(inScope *scope, v ast.Values, columnNames []
 			b.handleErr(err)
 		}
 		columnDefaultValues[i] = destSchema[index].Default
+		if columnDefaultValues[i] == nil && destSchema[index].Generated != nil {
+			columnDefaultValues[i] = destSchema[index].Generated
+		}
 	}
 
 	exprTuples := make([][]sql.Expression, len(v))
@@ -390,8 +411,7 @@ func (b *Builder) buildUpdate(inScope *scope, u *ast.Update) (outScope *scope) {
 			return true
 		})
 	}
-	update.Checks = checks
-	outScope.node = update
+	outScope.node = update.WithChecks(checks)
 	return
 }
 
@@ -509,7 +529,12 @@ func (b *Builder) buildInto(inScope *scope, into *ast.Into) {
 		if strings.HasPrefix(val.String(), "@") {
 			vars[i] = expression.NewUserVar(strings.TrimPrefix(val.String(), "@"))
 		} else {
-			vars[i] = expression.NewUnresolvedProcedureParam(val.String())
+			col, ok := inScope.proc.GetVar(val.String())
+			if !ok {
+				err := sql.ErrExternalProcedureMissingContextParam.New(val.String())
+				b.handleErr(err)
+			}
+			vars[i] = col.scalarGf()
 		}
 	}
 	inScope.node = plan.NewInto(inScope.node, vars)

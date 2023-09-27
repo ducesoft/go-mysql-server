@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -20,10 +34,12 @@ type scope struct {
 	ast    ast.SQLNode
 	node   sql.Node
 
-	subquery bool
+	activeSubquery *subquery
+	refsSubquery   bool
 
 	// cols are definitions provided by this scope
-	cols []scopeColumn
+	cols   []scopeColumn
+	colset sql.ColSet
 	// extraCols are auxillary output columns required
 	// for sorting or grouping
 	extraCols []scopeColumn
@@ -113,6 +129,9 @@ func (s *scope) resolveColumn(table, col string, checkParent bool) (scopeColumn,
 		return scopeColumn{}, false
 	}
 
+	if s.parent.activeSubquery != nil {
+		s.parent.activeSubquery.addOutOfScope(c.id)
+	}
 	return c, true
 }
 
@@ -182,6 +201,7 @@ func (s *scope) initProc() {
 		cursors:    make(map[string]struct{}),
 		vars:       make(map[string]scopeColumn),
 		labels:     make(map[string]bool),
+		lastState:  dsVariable,
 	}
 }
 
@@ -189,6 +209,51 @@ func (s *scope) initProc() {
 // functions and function inputs.
 func (s *scope) initGroupBy() {
 	s.groupBy = &groupBy{outScope: s.replace()}
+}
+
+// pushSubquery creates a new scope with the subquery already initialized.
+func (s *scope) pushSubquery() *scope {
+	newScope := s.push()
+	newScope.activeSubquery = &subquery{parent: s.nearestSubquery()}
+	return newScope
+}
+
+// replaceSubquery creates a new scope with the subquery already initialized.
+func (s *scope) replaceSubquery() *scope {
+	newScope := s.replace()
+	newScope.activeSubquery = &subquery{parent: s.nearestSubquery()}
+	return newScope
+}
+
+// initSubquery creates a container for tracking out of scope
+// column references and volatile functions.
+func (s *scope) initSubquery() {
+	s.activeSubquery = &subquery{}
+}
+
+func (s *scope) correlated() sql.ColSet {
+	if s.activeSubquery == nil {
+		return sql.ColSet{}
+	}
+	return s.activeSubquery.correlated
+}
+
+func (s *scope) volatile() bool {
+	if s.activeSubquery == nil {
+		return false
+	}
+	return s.activeSubquery.volatile
+}
+
+func (s *scope) nearestSubquery() *subquery {
+	n := s
+	for n != nil {
+		if n.activeSubquery != nil {
+			return n.activeSubquery
+		}
+		n = n.parent
+	}
+	return nil
 }
 
 // setTableAlias updates column definitions in this scope to
@@ -308,6 +373,9 @@ func (s *scope) copy() *scope {
 		ret.cols = make([]scopeColumn, len(s.cols))
 		copy(ret.cols, s.cols)
 	}
+	if !s.colset.Empty() {
+		ret.colset = s.colset.Copy()
+	}
 
 	return &ret
 }
@@ -360,6 +428,7 @@ func (s *scope) redirect(from, to scopeColumn) {
 // column identity
 func (s *scope) addColumn(col scopeColumn) {
 	s.cols = append(s.cols, col)
+	s.colset.Add(sql.ColumnId(col.id))
 	if s.exprs == nil {
 		s.exprs = make(map[string]columnId)
 	}
@@ -442,15 +511,16 @@ type tableId uint16
 type columnId uint16
 
 type scopeColumn struct {
+	nullable    bool
+	descending  bool
+	outOfScope  bool
+	id          columnId
+	typ         sql.Type
+	scalar      sql.Expression
 	db          string
 	table       string
 	col         string
 	originalCol string
-	id          columnId
-	typ         sql.Type
-	scalar      sql.Expression
-	nullable    bool
-	descending  bool
 }
 
 // empty returns true if a scopeColumn is the null value

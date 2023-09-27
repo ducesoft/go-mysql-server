@@ -80,18 +80,25 @@ func validateColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node, _ *plan.S
 
 			// There may be multiple DDL nodes in the plan (ALTER TABLE statements can have many clauses), and for each of them
 			// we need to count the column indexes in the very hacky way outlined above.
-			colIndex := 0
+			i := 0
 			return transform.NodeExprs(n, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 				eWrapper, ok := e.(*expression.Wrapper)
 				if !ok {
 					return e, transform.SameTree, nil
 				}
 
-				col, err := lookupColumnForTargetSchema(ctx, node, colIndex)
+				defer func() {
+					i++
+				}()
+
+				if eWrapper.Unwrap() == nil {
+					return e, transform.SameTree, nil
+				}
+
+				col, err := lookupColumnForTargetSchema(ctx, node, i)
 				if err != nil {
 					return nil, transform.SameTree, err
 				}
-				colIndex++
 
 				err = validateColumnDefault(ctx, col, eWrapper)
 				if err != nil {
@@ -185,30 +192,32 @@ func stripTableNamesFromColumnDefaults(ctx *sql.Context, _ *Analyzer, n sql.Node
 func lookupColumnForTargetSchema(_ *sql.Context, node sql.SchemaTarget, colIndex int) (*sql.Column, error) {
 	schema := node.TargetSchema()
 
-	switch n2 := node.(type) {
+	switch n := node.(type) {
 	case *plan.ModifyColumn:
 		if colIndex < len(schema) {
 			return schema[colIndex], nil
 		} else {
-			return n2.NewColumn(), nil
+			return n.NewColumn(), nil
 		}
 	case *plan.AddColumn:
 		if colIndex < len(schema) {
 			return schema[colIndex], nil
 		} else {
-			return n2.Column(), nil
+			return n.Column(), nil
 		}
 	case *plan.AlterDefaultSet:
-		index := schema.IndexOfColName(n2.ColumnName)
+		index := schema.IndexOfColName(n.ColumnName)
 		if index == -1 {
-			return nil, sql.ErrTableColumnNotFound.New(n2.Table, n2.ColumnName)
+			return nil, sql.ErrTableColumnNotFound.New(n.Table, n.ColumnName)
 		}
 		return schema[index], nil
 	default:
 		if colIndex < len(schema) {
 			return schema[colIndex], nil
 		} else {
-			return nil, sql.ErrColumnNotFound.New(colIndex)
+			// TODO: sql.ErrColumnNotFound would be a better error here, but we need to add all the different node types to
+			//  the switch to get it
+			return nil, expression.ErrIndexOutOfBounds.New(colIndex, len(schema))
 		}
 	}
 }
@@ -228,7 +237,7 @@ func validateColumnDefault(ctx *sql.Context, col *sql.Column, e *expression.Wrap
 	// Some column types can only have a NULL for a literal default, must be an expression otherwise
 	isLiteralRestrictedType := types.IsTextBlob(col.Type) || types.IsJSON(col.Type) || types.IsGeometry(col.Type)
 	if isLiteralRestrictedType && newDefault.IsLiteral() {
-		lit, err := newDefault.Expression.Eval(ctx, nil)
+		lit, err := newDefault.Expr.Eval(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -238,7 +247,7 @@ func validateColumnDefault(ctx *sql.Context, col *sql.Column, e *expression.Wrap
 	}
 
 	var err error
-	sql.Inspect(newDefault.Expression, func(e sql.Expression) bool {
+	sql.Inspect(newDefault.Expr, func(e sql.Expression) bool {
 		switch e.(type) {
 		case sql.FunctionExpression, *expression.UnresolvedFunction:
 			var funcName string
@@ -305,7 +314,7 @@ func stripTableNamesFromDefault(e *expression.Wrapper) (sql.Expression, transfor
 		return e, transform.SameTree, nil
 	}
 
-	newExpr, same, err := transform.Expr(newDefault.Expression, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+	newExpr, same, err := transform.Expr(newDefault.Expr, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 		if expr, ok := e.(*expression.GetField); ok {
 			return expr.WithTable(""), transform.NewTree, nil
 		}
@@ -320,6 +329,6 @@ func stripTableNamesFromDefault(e *expression.Wrapper) (sql.Expression, transfor
 	}
 
 	nd := *newDefault
-	nd.Expression = newExpr
+	nd.Expr = newExpr
 	return expression.WrapExpression(&nd), transform.NewTree, nil
 }

@@ -31,7 +31,7 @@ type ShowCreateTable struct {
 	*UnaryNode
 	IsView           bool
 	Indexes          []sql.Index
-	Checks           sql.CheckConstraints
+	checks           sql.CheckConstraints
 	targetSchema     sql.Schema
 	PrimaryKeySchema sql.PrimaryKeySchema
 	asOf             sql.Expression
@@ -40,6 +40,7 @@ type ShowCreateTable struct {
 var _ sql.Node = (*ShowCreateTable)(nil)
 var _ sql.Expressioner = (*ShowCreateTable)(nil)
 var _ sql.SchemaTarget = (*ShowCreateTable)(nil)
+var _ sql.CheckConstraintNode = (*ShowCreateTable)(nil)
 var _ sql.CollationCoercible = (*ShowCreateTable)(nil)
 var _ Versionable = (*ShowCreateTable)(nil)
 
@@ -57,9 +58,23 @@ func NewShowCreateTableWithAsOf(table sql.Node, isView bool, asOf sql.Expression
 	}
 }
 
+func (sc *ShowCreateTable) Checks() sql.CheckConstraints {
+	return sc.checks
+}
+
+func (sc *ShowCreateTable) WithChecks(checks sql.CheckConstraints) sql.Node {
+	ret := *sc
+	ret.checks = checks
+	return &ret
+}
+
 // Resolved implements the Resolvable interface.
 func (sc *ShowCreateTable) Resolved() bool {
 	return sc.Child.Resolved() && sc.targetSchema.Resolved()
+}
+
+func (sc *ShowCreateTable) IsReadOnly() bool {
+	return true
 }
 
 func (sc ShowCreateTable) WithChildren(children ...sql.Node) (sql.Node, error) {
@@ -112,7 +127,12 @@ func (sc ShowCreateTable) WithExpressions(exprs ...sql.Expression) (sql.Node, er
 		return nil, sql.ErrInvalidChildrenNumber.New(sc, len(exprs), len(sc.targetSchema))
 	}
 
-	sc.targetSchema = transform.SchemaWithDefaults(sc.targetSchema, exprs)
+	sch, err := transform.SchemaWithDefaults(sc.targetSchema, exprs)
+	if err != nil {
+		return nil, err
+	}
+
+	sc.targetSchema = sch
 	return &sc, nil
 }
 

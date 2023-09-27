@@ -19,7 +19,6 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
-	"github.com/dolthub/go-mysql-server/sql/fixidx"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/transform"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -39,8 +38,19 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 	}
 
 	pushdownAboveTables := func(n sql.Node, filters *filterSet) (sql.Node, transform.TreeIdentity, error) {
-		return transform.NodeWithCtx(n, filterPushdownAboveTablesChildSelector, func(c transform.Context) (sql.Node, transform.TreeIdentity, error) {
+		return transform.NodeWithCtx(n, filterPushdownChildSelector, func(c transform.Context) (sql.Node, transform.TreeIdentity, error) {
 			switch node := c.Node.(type) {
+			case *plan.Filter:
+				// Notably, filters are allowed to be pushed through other filters.
+				// This prevents filters hoisted from join conditions from being
+				// orphaned in the middle of join trees.
+				if f, ok := node.Child.(*plan.Filter); ok {
+					if node.Expression == f.Expression {
+						return f, transform.NewTree, nil
+					}
+					return plan.NewFilter(expression.JoinAnd(node.Expression, f.Expression), f.Child), transform.NewTree, nil
+				}
+				return node, transform.SameTree, nil
 			case *plan.TableAlias, *plan.ResolvedTable, *plan.ValueDerivedTable:
 				table, same, err := pushdownFiltersToAboveTable(ctx, a, node.(sql.NameableNode), scope, filters)
 				if err != nil {
@@ -49,13 +59,9 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 				if same {
 					return node, transform.SameTree, nil
 				}
-				node, _, err = pushdownFixIndices(ctx, a, table, scope)
-				if err != nil {
-					return nil, transform.SameTree, err
-				}
-				return node, transform.NewTree, nil
+				return table, transform.NewTree, nil
 			default:
-				return pushdownFixIndices(ctx, a, node, scope)
+				return node, transform.SameTree, nil
 			}
 		})
 	}
@@ -69,6 +75,12 @@ func pushFilters(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope, s
 	return transform.Node(n, func(node sql.Node) (sql.Node, transform.TreeIdentity, error) {
 		switch n := node.(type) {
 		case *plan.Filter:
+			switch n.Child.(type) {
+			case *plan.TableAlias, *plan.ResolvedTable, *plan.IndexedTableAccess, *plan.ValueDerivedTable:
+				// can't push any lower
+				return n, transform.SameTree, nil
+			default:
+			}
 			// Find all col exprs and group them by the table they mention so that we can keep track of which ones
 			// have been pushed down and need to be removed from the parent filter
 			filtersByTable := getFiltersByTable(n)
@@ -107,12 +119,23 @@ func pushdownSubqueryAliasFilters(ctx *sql.Context, a *Analyzer, n sql.Node, sco
 		return n, transform.SameTree, nil
 	}
 
+	if !hasSubqueryAlias(n) {
+		return n, transform.SameTree, nil
+	}
+
 	tableAliases, err := getTableAliases(n, scope)
 	if err != nil {
 		return nil, transform.SameTree, err
 	}
 
 	return transformPushdownSubqueryAliasFilters(ctx, a, n, scope, tableAliases)
+}
+
+func hasSubqueryAlias(n sql.Node) bool {
+	return transform.InspectUp(n, func(n sql.Node) bool {
+		_, isSubq := n.(*plan.SubqueryAlias)
+		return isSubq
+	})
 }
 
 // canDoPushdown returns whether the node given can safely be analyzed for pushdown
@@ -135,9 +158,11 @@ func canDoPushdown(n sql.Node) bool {
 	return true
 }
 
-// Pushing down a filter is incompatible with the secondary table in a Left or Right join. If we push a predicate on
-// the secondary table below the join, we end up not evaluating it in all cases (since the secondary table result is
-// sometimes null in these types of joins). It must be evaluated only after the join result is computed.
+// Pushing down a filter is incompatible with the secondary table in a Left
+// or Right join. If we push a predicate on the secondary table below the
+// join, we end up not evaluating it in all cases (since the secondary table
+// result is sometimes null in these types of joins). It must be evaluated
+// only after the join result is computed.
 func filterPushdownChildSelector(c transform.Context) bool {
 	switch c.Node.(type) {
 	case *plan.Limit:
@@ -167,29 +192,6 @@ func filterPushdownChildSelector(c transform.Context) bool {
 		}
 	default:
 	}
-	return true
-}
-
-// Like filterPushdownChildSelector, but for pushing filters down via the introduction of additional Filter nodes
-// (for tables that can't treat the filter as an index lookup or accept it directly). In this case, we want to avoid
-// introducing additional Filter nodes unnecessarily. This means only introducing new filter nodes when they are being
-// pushed below a join or other structure.
-func filterPushdownAboveTablesChildSelector(c transform.Context) bool {
-	// All the same restrictions that apply to pushing filters down in general apply here as well
-	if !filterPushdownChildSelector(c) {
-		return false
-	}
-	switch c.Parent.(type) {
-	case *plan.Filter:
-		switch c.Node.(type) {
-		// Don't bother pushing filters down above tables if the direct child node is a table. At best this
-		// just splits the predicates into multiple filter nodes, and at worst it breaks other parts of the
-		// analyzer that don't expect this structure in the tree.
-		case *plan.TableAlias, *plan.ResolvedTable, *plan.IndexedTableAccess, *plan.ValueDerivedTable:
-			return false
-		}
-	}
-
 	return true
 }
 
@@ -243,18 +245,14 @@ func pushdownFiltersToAboveTable(
 	// Move any remaining filters for the table directly above the table itself
 	var pushedDownFilterExpression sql.Expression
 	if tableFilters := filters.availableFiltersForTable(ctx, tableNode.Name()); len(tableFilters) > 0 {
-		handled, _, err := fixidx.FixFieldIndexesOnExpressions(scope, a.LogFn(), tableNode.Schema(), tableFilters...)
-		if err != nil {
-			return nil, transform.SameTree, err
-		}
-		filters.markFiltersHandled(handled...)
-		pushedDownFilterExpression = expression.JoinAnd(handled...)
+		filters.markFiltersHandled(tableFilters...)
+		pushedDownFilterExpression = expression.JoinAnd(tableFilters...)
 
 		a.Log(
 			"pushed down filters %s above table %q, %d filters handled of %d",
-			handled,
+			tableFilters,
 			tableNode.Name(),
-			len(handled),
+			len(tableFilters),
 			len(tableFilters),
 		)
 	}
@@ -277,30 +275,33 @@ func pushdownFiltersToAboveTable(
 // filters down below it can help find index usage opportunities later in the
 // analysis phase.
 func pushdownFiltersUnderSubqueryAlias(ctx *sql.Context, a *Analyzer, sa *plan.SubqueryAlias, filters *filterSet) (sql.Node, transform.TreeIdentity, error) {
+	if sa.ScopeMapping == nil {
+		return sa, transform.SameTree, nil
+	}
 	handled := filters.availableFiltersForTable(ctx, sa.Name())
 	if len(handled) == 0 {
 		return sa, transform.SameTree, nil
 	}
 	filters.markFiltersHandled(handled...)
-	schema := sa.Schema()
-	handled, _, err := fixidx.FixFieldIndexesOnExpressions(nil, a.LogFn(), schema, handled...)
-	if err != nil {
-		return nil, transform.SameTree, err
-	}
-
 	// |handled| is in terms of the parent schema, and in particular the
 	// |Source| is the alias name. Rewrite it to refer to the |sa.Child|
 	// schema instead.
-	childSchema := sa.Child.Schema()
 	expressionsForChild := make([]sql.Expression, len(handled))
+	var err error
 	for i, h := range handled {
 		expressionsForChild[i], _, err = transform.Expr(h, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 			if gt, ok := e.(*expression.GetField); ok {
-				col := childSchema[gt.Index()]
-				return gt.WithTable(col.Source).WithName(col.Name), transform.NewTree, nil
+				gf, ok := sa.ScopeMapping[gt.Id()]
+				if !ok {
+					return e, transform.SameTree, fmt.Errorf("unable to find child with id: %d", gt.Index())
+				}
+				return gf, transform.NewTree, nil
 			}
 			return e, transform.SameTree, nil
 		})
+		if err != nil {
+			return sa, transform.SameTree, err
+		}
 	}
 
 	n, err := sa.WithChildren(plan.NewFilter(expression.JoinAnd(expressionsForChild...), sa.Child))
@@ -364,7 +365,7 @@ func getIndexesByTable(ctx *sql.Context, a *Analyzer, node sql.Node, scope *plan
 			return true
 		}
 
-		indexAnalyzer, err := newIndexAnalyzerForNode(ctx, node)
+		indexAnalyzer, err := newIndexAnalyzerForNode(ctx, filter.Child)
 		if err != nil {
 			errInAnalysis = err
 			return false
@@ -411,14 +412,4 @@ func convertIsNullForIndexes(ctx *sql.Context, e sql.Expression) sql.Expression 
 		return expression.NewNullSafeEquals(isNull.Child, expression.NewLiteral(nil, types.Null)), transform.NewTree, nil
 	})
 	return expr
-}
-
-// pushdownFixIndices fixes field indices for non-join expressions (replanJoin
-// is responsible for join filters and conditions.)
-func pushdownFixIndices(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scope) (sql.Node, transform.TreeIdentity, error) {
-	switch n := n.(type) {
-	case *plan.JoinNode, *plan.HashLookup, *plan.InsertInto:
-		return n, transform.SameTree, nil
-	}
-	return fixidx.FixFieldIndexesForExpressions(ctx, a.LogFn(), n, scope)
 }

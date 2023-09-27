@@ -53,6 +53,7 @@ const (
 	setInsertColumnsId                           // setInsertColumns
 	validateJoinComplexityId                     // validateJoinComplexity
 	applyBinlogReplicaControllerId               // applyBinlogReplicaController
+	applyEventSchedulerId                        // applyEventScheduler
 
 	// default
 	resolveUsingJoinsId            // resolveUsingJoins
@@ -101,8 +102,8 @@ const (
 	subqueryIndexesId            // subqueryIndexes
 	pruneTablesId                // pruneTables
 	fixupAuxiliaryExprsId        // fixupAuxiliaryExprs
+	assignExecIndexesId          // assignExecIndexes
 	inlineSubqueryAliasRefsId    // inlineSubqueryAliasRefs
-	setJoinScopeLenId            // setJoinScopeLen
 	eraseProjectionId            // eraseProjection
 	replaceSortPkId              // replaceSortPk
 	insertTopNId                 // insertTopN

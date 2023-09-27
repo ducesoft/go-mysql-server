@@ -18,15 +18,16 @@ import (
 	"fmt"
 	"log"
 	"testing"
-	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/go-mysql-server/enginetest"
 	"github.com/dolthub/go-mysql-server/enginetest/queries"
 	"github.com/dolthub/go-mysql-server/enginetest/scriptgen/setup"
 	"github.com/dolthub/go-mysql-server/memory"
-	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
 	_ "github.com/dolthub/go-mysql-server/sql/variables"
 )
@@ -89,7 +90,8 @@ func TestQueriesPreparedSimple(t *testing.T) {
 
 // TestQueriesSimple runs the canonical test queries against a single threaded index enabled harness.
 func TestQueriesSimple(t *testing.T) {
-	enginetest.TestQueries(t, enginetest.NewMemoryHarness("simple", 1, testNumPartitions, true, nil))
+	harness := enginetest.NewMemoryHarness("simple", 1, testNumPartitions, true, nil)
+	enginetest.TestQueries(t, harness)
 }
 
 // TestJoinQueries runs the canonical test queries against a single threaded index enabled harness.
@@ -132,22 +134,19 @@ func TestSingleQuery(t *testing.T) {
 	t.Skip()
 	var test queries.QueryTest
 	test = queries.QueryTest{
-		Query: `
-		select /*+ JOIN_ORDER(scalarSubq0,xy) */ count(*) from xy where y in (select distinct v from uv);
-`,
-		Expected: []sql.Row{},
+		Query:    `select count((select * from (select pk from one_pk limit 1) as sq)) from one_pk;`,
+		Expected: []sql.Row{{0}, {1}},
 	}
 
 	fmt.Sprintf("%v", test)
 	harness := enginetest.NewMemoryHarness("", 1, testNumPartitions, false, nil)
-	harness.Setup(setup.XySetup...)
+	// harness.UseServer()
+	harness.Setup(setup.MydbData, setup.MytableData)
 	engine, err := harness.NewEngine(t)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
 
-	engine.Analyzer.Debug = true
-	engine.Analyzer.Verbose = true
+	engine.EngineAnalyzer().Debug = true
+	engine.EngineAnalyzer().Verbose = true
 
 	enginetest.TestQueryWithEngine(t, harness, engine, test)
 }
@@ -178,10 +177,17 @@ func TestSingleQueryPrepared(t *testing.T) {
 		panic(err)
 	}
 
-	engine.Analyzer.Debug = true
-	engine.Analyzer.Verbose = true
+	engine.EngineAnalyzer().Debug = true
+	engine.EngineAnalyzer().Verbose = true
 
 	enginetest.TestScriptWithEnginePrepared(t, engine, harness, test)
+}
+
+func newUpdateResult(matched, updated int) types.OkResult {
+	return types.OkResult{
+		RowsAffected: uint64(updated),
+		Info:         plan.UpdateInfo{Matched: matched, Updated: updated},
+	}
 }
 
 // Convenience test for debugging a single query. Unskip and set to the desired query.
@@ -189,71 +195,19 @@ func TestSingleScript(t *testing.T) {
 	t.Skip()
 	var scripts = []queries.ScriptTest{
 		{
-			Name: "datetime precision",
+			Name: "add new generated column",
 			SetUpScript: []string{
-				"CREATE TABLE t1 (pk int primary key, d datetime)",
-				"CREATE TABLE t2 (pk int primary key, d datetime(3))",
-				"CREATE TABLE t3 (pk int primary key, d datetime(6))",
+				"create table t1 (a int primary key, b int)",
+				"insert into t1 values (1,2), (2,3), (3,4)",
 			},
 			Assertions: []queries.ScriptTestAssertion{
 				{
-					Query: "show create table t1",
-					Expected: []sql.Row{{"t1",
-						"CREATE TABLE `t1` (\n" +
-							"  `pk` int NOT NULL,\n" +
-							"  `d` datetime(0),\n" +
-							"  PRIMARY KEY (`pk`)\n" +
-							") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+					Query:    "alter table t1 add column c int as (a + b) stored",
+					Expected: []sql.Row{{types.NewOkResult(0)}},
 				},
 				{
-					Query:    "insert into t1 values (1, '2020-01-01 00:00:00.123456')",
-					Expected: []sql.Row{{types.NewOkResult(1)}},
-				},
-				{
-					Query:    "select * from t1 order by pk",
-					Expected: []sql.Row{{1, queries.MustParseTime(time.DateTime, "2020-01-01 00:00:00")}},
-				},
-				{
-					Query: "show create table t2",
-					Expected: []sql.Row{{"t2",
-						"CREATE TABLE `t2` (\n" +
-							"  `pk` int NOT NULL,\n" +
-							"  `d` datetime(3),\n" +
-							"  PRIMARY KEY (`pk`)\n" +
-							") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
-				},
-				{
-					Query:    "insert into t2 values (1, '2020-01-01 00:00:00.123456')",
-					Expected: []sql.Row{{types.NewOkResult(1)}},
-				},
-				{
-					Query:    "select * from t2 order by pk",
-					Expected: []sql.Row{{1, queries.MustParseTime(time.RFC3339Nano, "2020-01-01T00:00:00.123000000Z")}},
-				},
-				{
-					Query: "show create table t3",
-					Expected: []sql.Row{{"t3",
-						"CREATE TABLE `t3` (\n" +
-							"  `pk` int NOT NULL,\n" +
-							"  `d` datetime(6),\n" +
-							"  PRIMARY KEY (`pk`)\n" +
-							") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
-				},
-				{
-					Query:    "insert into t3 values (1, '2020-01-01 00:00:00.123456')",
-					Expected: []sql.Row{{types.NewOkResult(1)}},
-				},
-				{
-					Query:    "select * from t3 order by pk",
-					Expected: []sql.Row{{1, queries.MustParseTime(time.RFC3339Nano, "2020-01-01T00:00:00.123456000Z")}},
-				},
-				{
-					Query:       "create table t4 (pk int primary key, d datetime(-1))",
-					ExpectedErr: sql.ErrSyntaxError,
-				},
-				{
-					Query:          "create table t4 (pk int primary key, d datetime(7))",
-					ExpectedErrStr: "DATETIME supports precision from 0 to 6",
+					Query:    "select * from t1 order by a",
+					Expected: []sql.Row{{1, 2, 3}, {2, 3, 5}, {3, 4, 7}},
 				},
 			},
 		},
@@ -261,12 +215,13 @@ func TestSingleScript(t *testing.T) {
 
 	for _, test := range scripts {
 		harness := enginetest.NewMemoryHarness("", 1, testNumPartitions, true, nil)
+		harness.Setup(setup.MydbData)
 		engine, err := harness.NewEngine(t)
 		if err != nil {
 			panic(err)
 		}
-		engine.Analyzer.Debug = true
-		engine.Analyzer.Verbose = true
+		engine.EngineAnalyzer().Debug = true
+		engine.EngineAnalyzer().Verbose = true
 
 		enginetest.TestScriptWithEngine(t, engine, harness, test)
 	}
@@ -437,7 +392,7 @@ func TestAmbiguousColumnResolution(t *testing.T) {
 func TestInsertInto(t *testing.T) {
 	harness := enginetest.NewDefaultMemoryHarness()
 	harness.QueriesToSkip(
-		// should be colum not found error
+		// should be column not found error
 		"insert into a (select * from b) on duplicate key update b.i = a.i",
 		"insert into a (select * from b as t) on duplicate key update a.i = b.j + 100",
 	)
@@ -461,7 +416,11 @@ func TestInsertIntoErrors(t *testing.T) {
 }
 
 func TestBrokenInsertScripts(t *testing.T) {
-	enginetest.TestBrokenInsertScripts(t, enginetest.NewSkippingMemoryHarness())
+	enginetest.TestBrokenInsertScripts(t, enginetest.NewDefaultMemoryHarness())
+}
+
+func TestGeneratedColumns(t *testing.T) {
+	enginetest.TestGeneratedColumns(t, enginetest.NewDefaultMemoryHarness())
 }
 
 func TestStatistics(t *testing.T) {
@@ -653,12 +612,6 @@ func TestDropForeignKeys(t *testing.T) {
 }
 
 func TestForeignKeys(t *testing.T) {
-	for i := len(queries.ForeignKeyTests) - 1; i >= 0; i-- {
-		//TODO: memory tables don't quite handle keyless foreign keys properly
-		if queries.ForeignKeyTests[i].Name == "Keyless CASCADE over three tables" {
-			queries.ForeignKeyTests = append(queries.ForeignKeyTests[:i], queries.ForeignKeyTests[i+1:]...)
-		}
-	}
 	enginetest.TestForeignKeys(t, enginetest.NewDefaultMemoryHarness())
 }
 
@@ -691,7 +644,7 @@ func TestDropConstraints(t *testing.T) {
 }
 
 func TestReadOnly(t *testing.T) {
-	enginetest.TestReadOnly(t, enginetest.NewDefaultMemoryHarness())
+	enginetest.TestReadOnly(t, enginetest.NewDefaultMemoryHarness(), true /* testStoredProcedures */)
 }
 
 func TestViews(t *testing.T) {
@@ -756,7 +709,6 @@ func TestAddDropPks(t *testing.T) {
 }
 
 func TestAddAutoIncrementColumn(t *testing.T) {
-	t.Skip("in memory tables don't implement sql.RewritableTable yet")
 	for _, script := range queries.AlterTableAddAutoIncrementScripts {
 		enginetest.TestScript(t, enginetest.NewDefaultMemoryHarness(), script)
 	}
@@ -779,12 +731,14 @@ func TestIndexPrefix(t *testing.T) {
 }
 
 func TestPersist(t *testing.T) {
-	newSess := func(ctx *sql.Context) sql.PersistableSession {
+	harness := enginetest.NewDefaultMemoryHarness()
+	newSess := func(_ *sql.Context) sql.PersistableSession {
+		ctx := harness.NewSession()
 		persistedGlobals := memory.GlobalsMap{}
-		persistedSess := memory.NewInMemoryPersistedSession(ctx.Session, persistedGlobals)
-		return persistedSess
+		memSession := ctx.Session.(*memory.Session).SetGlobals(persistedGlobals)
+		return memSession
 	}
-	enginetest.TestPersist(t, enginetest.NewDefaultMemoryHarness(), newSess)
+	enginetest.TestPersist(t, harness, newSess)
 }
 
 func TestValidateSession(t *testing.T) {
@@ -793,11 +747,13 @@ func TestValidateSession(t *testing.T) {
 		count++
 	}
 
+	harness := enginetest.NewDefaultMemoryHarness()
 	newSess := func(ctx *sql.Context) sql.PersistableSession {
-		sess := memory.NewInMemoryPersistedSessionWithValidationCallback(ctx.Session, incrementValidateCb)
-		return sess
+		memSession := ctx.Session.(*memory.Session)
+		memSession.SetValidationCallback(incrementValidateCb)
+		return memSession
 	}
-	enginetest.TestValidateSession(t, enginetest.NewDefaultMemoryHarness(), newSess, &count)
+	enginetest.TestValidateSession(t, harness, newSess, &count)
 }
 
 func TestPrepared(t *testing.T) {
@@ -817,15 +773,18 @@ func TestCharsetCollationEngine(t *testing.T) {
 }
 
 func TestCharsetCollationWire(t *testing.T) {
-	enginetest.TestCharsetCollationWire(t, enginetest.NewDefaultMemoryHarness(), server.DefaultSessionBuilder)
+	harness := enginetest.NewDefaultMemoryHarness()
+	enginetest.TestCharsetCollationWire(t, harness, harness.SessionBuilder())
 }
 
 func TestDatabaseCollationWire(t *testing.T) {
-	enginetest.TestDatabaseCollationWire(t, enginetest.NewDefaultMemoryHarness(), server.DefaultSessionBuilder)
+	harness := enginetest.NewDefaultMemoryHarness()
+	enginetest.TestDatabaseCollationWire(t, harness, harness.SessionBuilder())
 }
 
 func TestTypesOverWire(t *testing.T) {
-	enginetest.TestTypesOverWire(t, enginetest.NewDefaultMemoryHarness(), server.DefaultSessionBuilder)
+	harness := enginetest.NewDefaultMemoryHarness()
+	enginetest.TestTypesOverWire(t, harness, harness.SessionBuilder())
 }
 
 func mergableIndexDriver(dbs []sql.Database) sql.IndexDriver {

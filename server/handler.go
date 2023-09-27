@@ -107,7 +107,6 @@ func (h *Handler) ComPrepare(c *mysql.Conn, query string) ([]*query.Field, error
 	if err != nil {
 		return nil, err
 	}
-
 	var analyzed sql.Node
 	if analyzer.PreparedStmtDisabled {
 		analyzed, err = h.e.AnalyzeQuery(ctx, query)
@@ -146,12 +145,7 @@ func (h *Handler) ParserOptionsForConnection(c *mysql.Conn) (sqlparser.ParserOpt
 	if err != nil {
 		return sqlparser.ParserOptions{}, err
 	}
-
-	sqlMode, err := sql.LoadSqlMode(ctx)
-	if err != nil {
-		return sqlparser.ParserOptions{}, err
-	}
-	return sqlMode.ParserOptions(), nil
+	return sql.LoadSqlMode(ctx).ParserOptions(), nil
 }
 
 // ConnectionClosed reports that a connection has been closed.
@@ -216,7 +210,7 @@ func (h *Handler) doQuery(
 	var remainder string
 	var prequery string
 	var parsed sqlparser.Statement
-	if mode == MultiStmtModeOn {
+	if _, ok := h.e.PreparedDataCache.GetCachedStmt(ctx.Session.ID(), query); mode == MultiStmtModeOn && !ok {
 		parsed, prequery, remainder, err = planbuilder.ParseOnly(ctx, query, true)
 		if prequery != "" {
 			query = prequery
@@ -229,14 +223,15 @@ func (h *Handler) doQuery(
 	var queryStr string
 	if h.encodeLoggedQuery {
 		queryStr = base64.StdEncoding.EncodeToString([]byte(query))
-	} else {
+	} else if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		// this is expensive, so skip this unless we're logging at DEBUG level
 		queryStr = string(queryLoggingRegex.ReplaceAll([]byte(query), []byte(" ")))
 		if h.maxLoggedQueryLen > 0 && len(queryStr) > h.maxLoggedQueryLen {
 			queryStr = queryStr[:h.maxLoggedQueryLen] + "..."
 		}
 	}
 
-	if h.encodeLoggedQuery || h.maxLoggedQueryLen >= 0 {
+	if queryStr != "" {
 		ctx.SetLogger(ctx.GetLogger().WithField("query", queryStr))
 	}
 	ctx.GetLogger().Debugf("Starting query")
@@ -260,7 +255,7 @@ func (h *Handler) doQuery(
 		}
 	}()
 
-	schema, rowIter, err := h.e.QueryNodeWithBindings(ctx, query, parsed, bindings)
+	schema, rowIter, err := h.e.QueryWithBindings(ctx, query, parsed, bindings)
 	if err != nil {
 		ctx.GetLogger().WithError(err).Warn("error running query")
 		return remainder, err
@@ -598,9 +593,9 @@ func row2ToSQL(s sql.Schema, row sql.Row2) ([]sqltypes.Value, error) {
 func schemaToFields(ctx *sql.Context, s sql.Schema) []*query.Field {
 	fields := make([]*query.Field, len(s))
 	for i, c := range s {
-		var charset uint32 = mysql.CharacterSetUtf8
-		if types.IsBinaryType(c.Type) {
-			charset = mysql.CharacterSetBinary
+		charset := uint32(sql.Collation_Default.CharacterSet())
+		if collatedType, ok := c.Type.(sql.TypeWithCollation); ok {
+			charset = uint32(collatedType.Collation().CharacterSet())
 		}
 
 		fields[i] = &query.Field{

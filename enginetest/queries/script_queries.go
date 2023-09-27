@@ -25,6 +25,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer/analyzererrors"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/dolthub/go-mysql-server/sql/types"
 )
 
@@ -43,6 +44,8 @@ type ScriptTest struct {
 	ExpectedErr *errors.Kind
 	// For tests that make a single assertion, ExpectedIndexes can be set for the string representation of indexes that we expect to appear in the query plan
 	ExpectedIndexes []string
+	// For tests that perform join operations, JoinTypes can be set for the type of merge we expect to perform.
+	JoinTypes []plan.JoinType
 	// SkipPrepared is true when we skip a test for prepared statements only
 	SkipPrepared bool
 }
@@ -73,6 +76,9 @@ type ScriptTestAssertion struct {
 	// The string representation of indexes that we expect to appear in the query plan
 	ExpectedIndexes []string
 
+	// For tests that perform join operations, JoinTypes can be set for the type of merge we expect to perform.
+	JoinTypes []plan.JoinType
+
 	// SkipResultsCheck is used to skip assertions on expected Rows returned from a query. This should be used
 	// sparingly, such as in cases where you only want to test warning messages.
 	SkipResultsCheck bool
@@ -89,6 +95,252 @@ type ScriptTestAssertion struct {
 // Unlike other engine tests, ScriptTests must be self-contained. No other tables are created outside the definition of
 // the tests.
 var ScriptTests = []ScriptTest{
+	{
+		Name: "union schema merge",
+		SetUpScript: []string{
+			"create table `left` (i int primary key, j mediumint, k varchar(20));",
+			"create table `right` (i int primary key, j bigint, k text);",
+			"insert into `left` values (1,2, 'a')",
+			"insert into `right` values (3,4, 'b')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "select i, j from `left` union select i, j from `right`",
+				ExpectedColumns: sql.Schema{
+					{
+						Name: "i",
+						Type: types.Int32,
+					},
+					{
+						Name: "j",
+						Type: types.Int64,
+					},
+				},
+				Expected: []sql.Row{{1, 2}, {3, 4}},
+			},
+			{
+				Query: "select i, k from `left` union select i, k from `right`",
+				ExpectedColumns: sql.Schema{
+					{
+						Name: "i",
+						Type: types.Int32,
+					},
+					{
+						Name: "k",
+						Type: types.LongText,
+					},
+				},
+				Expected: []sql.Row{{1, "a"}, {3, "b"}},
+			},
+			{
+				Query:       "select i, k from `left` union select i, j, k from `right`",
+				ExpectedErr: planbuilder.ErrUnionSchemasDifferentLength,
+			},
+		},
+	},
+	{
+		Name: "intersection and except tests",
+		SetUpScript: []string{
+			"create table a (m int, n int);",
+			"insert into a values (1,2), (2,3), (3,4);",
+			"create table b (m int, n int);",
+			"insert into b values (1,2), (1,3), (3,4);",
+			"create table c (m int, n int);",
+			"insert into c values (1,3), (1,3), (3,4);",
+			"create table t1 (i int);",
+			"insert into t1 values (1), (2), (3);",
+			"create table t2 (i float);",
+			"insert into t2 values (1.0), (1.99), (3.0);",
+			"create table l (i int);",
+			"insert into l values (1), (1), (1);",
+			"create table r (i int);",
+			"insert into r values (1);",
+		},
+		Assertions: []ScriptTestAssertion{
+			// Intersect tests
+			{
+				Query: "table a intersect table b order by m, n;",
+				Expected: []sql.Row{
+					{1, 2},
+					{3, 4},
+				},
+			},
+			{
+				Query: "table a intersect table c order by m, n;",
+				Expected: []sql.Row{
+					{3, 4},
+				},
+			},
+			{
+				Query: "table c intersect distinct table c order by m, n;",
+				Expected: []sql.Row{
+					{1, 3},
+					{3, 4},
+				},
+			},
+			{
+				Query: "table c intersect all table c order by m, n;",
+				Expected: []sql.Row{
+					{1, 3},
+					{1, 3},
+					{3, 4},
+				},
+			},
+			{
+				Query: "table a intersect table b intersect table c;",
+				Expected: []sql.Row{
+					{3, 4},
+				},
+			},
+			{
+				Query: "(table b order by m limit 1 offset 1) intersect (table c order by m limit 1);",
+				Expected: []sql.Row{
+					{1, 3},
+				},
+			},
+			{
+				// Resulting type is string for some reason
+				Skip:  true,
+				Query: "table t1 intersect table t2;",
+				Expected: []sql.Row{
+					{1},
+					{3},
+				},
+			},
+			{
+				// Field indexing error
+				Skip:  true,
+				Query: "table t1 intersect table t2 order by i;",
+				Expected: []sql.Row{
+					{1.0},
+				},
+			},
+
+			// Except tests
+			{
+				Query: "table a except table b order by m, n;",
+				Expected: []sql.Row{
+					{2, 3},
+				},
+			},
+			{
+				Query: "table a except table c order by m, n;",
+				Expected: []sql.Row{
+					{1, 2},
+					{2, 3},
+				},
+			},
+			{
+				Query: "table b except table c order by m, n;",
+				Expected: []sql.Row{
+					{1, 2},
+				},
+			},
+			{
+				Query: "table c except distinct table a order by m, n;",
+				Expected: []sql.Row{
+					{1, 3},
+				},
+			},
+			{
+				Query: "table c except all table a order by m, n;",
+				Expected: []sql.Row{
+					{1, 3},
+					{1, 3},
+				},
+			},
+			{
+				Query: "(table a order by m limit 1 offset 1) except (table c order by m limit 1);",
+				Expected: []sql.Row{
+					{2, 3},
+				},
+			},
+			{
+				Query: "table a except table b except table c;",
+				Expected: []sql.Row{
+					{2, 3},
+				},
+			},
+			{
+				// Resulting type is string for some reason
+				Skip:  true,
+				Query: "table t1 except table t2 order by i;",
+				Expected: []sql.Row{
+					{2.0},
+				},
+			},
+			{
+				Query:    "table l except table r;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "table l except distinct table r;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query: "table l except all table r;",
+				Expected: []sql.Row{
+					{1},
+					{1},
+				},
+			},
+
+			// Multiple set operation tests
+			{
+				Query: "table a except table b intersect table c order by m;",
+				Expected: []sql.Row{
+					{1, 2},
+					{2, 3},
+				},
+			},
+			{
+				Query: "table a intersect table b except table c order by m;",
+				Expected: []sql.Row{
+					{1, 2},
+				},
+			},
+			{
+				Query: "table a union table a intersect table b except table c order by m;",
+				Expected: []sql.Row{
+					{1, 2},
+					{2, 3},
+				},
+			},
+
+			// CTE tests
+			{
+				Query: "with cte as (table a union table a intersect table b except table c order by m) select * from cte",
+				Expected: []sql.Row{
+					{1, 2},
+					{2, 3},
+				},
+			},
+			{
+				Query: "with recursive cte(x) as (select 1) select * from cte",
+				Expected: []sql.Row{
+					{1},
+				},
+			},
+			{
+				Query: "with recursive cte (x,y) as (select 1, 1 intersect select 1, 1 union select x + 1, y + 2 from cte where x < 5) select * from cte;",
+				Expected: []sql.Row{
+					{1, 1},
+					{2, 3},
+					{3, 5},
+					{4, 7},
+					{5, 9},
+				},
+			},
+			{
+				Query:       "with recursive cte (x,y) as (select 1, 1 intersect select 1, 1 intersect select x + 1, y + 2 from cte where x < 5) select * from cte;",
+				ExpectedErr: sql.ErrRecursiveCTEMissingUnion,
+			},
+			{
+				Query:       "with recursive cte (x,y) as (select 1, 1 union select 1, 1 intersect select x + 1, y + 2 from cte where x < 5) select * from cte;",
+				ExpectedErr: sql.ErrRecursiveCTENotUnion,
+			},
+		},
+	},
 	{
 		Name: "create table casing",
 		SetUpScript: []string{
@@ -1251,7 +1503,20 @@ var ScriptTests = []ScriptTest{
 		},
 	},
 	{
-		Name: "ALTER TABLE ... ALTER COLUMN SET / DROP DEFAULT",
+		Name: "CONVERT USING still converts between incompatible character sets",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk BIGINT PRIMARY KEY, v1 VARCHAR(200)) COLLATE=utf8mb4_0900_ai_ci;",
+			"INSERT INTO test VALUES (1, '63273াম'), (2, 'GHD30r'), (3, '8জ্রিয277'), (4, NULL);",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT pk, v1, CONVERT(CONVERT(v1 USING latin1) USING utf8mb4) AS round_trip FROM test WHERE v1 <> CONVERT(CONVERT(v1 USING latin1) USING utf8mb4);",
+				Expected: []sql.Row{{int64(1), "63273াম", "63273??"}, {int64(3), "8জ্রিয277", "8?????277"}},
+			},
+		},
+	},
+	{
+		Name: "ALTER TABLE, ALTER COLUMN SET , DROP DEFAULT",
 		SetUpScript: []string{
 			"CREATE TABLE test (pk BIGINT PRIMARY KEY, v1 BIGINT NOT NULL DEFAULT 88);",
 		},
@@ -1266,7 +1531,7 @@ var ScriptTests = []ScriptTest{
 			},
 			{
 				Query:    "ALTER TABLE test ALTER v1 SET DEFAULT (CONVERT('42', SIGNED));",
-				Expected: []sql.Row{},
+				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
 				Query:    "INSERT INTO test (pk) VALUES (2);",
@@ -1282,7 +1547,7 @@ var ScriptTests = []ScriptTest{
 			},
 			{
 				Query:    "ALTER TABLE test ALTER v1 DROP DEFAULT;",
-				Expected: []sql.Row{},
+				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
 				Query:       "INSERT INTO test (pk) VALUES (3);",
@@ -1298,7 +1563,7 @@ var ScriptTests = []ScriptTest{
 			},
 			{
 				Query:    "ALTER TABLE test ALTER v1 SET DEFAULT 100, alter v1 DROP DEFAULT",
-				Expected: []sql.Row{},
+				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
 				Query:       "INSERT INTO test (pk) VALUES (2);",
@@ -1306,7 +1571,7 @@ var ScriptTests = []ScriptTest{
 			},
 			{
 				Query:    "ALTER TABLE test ALTER v1 SET DEFAULT 100, alter v1 SET DEFAULT 200",
-				Expected: []sql.Row{},
+				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
 				Query:       "ALTER TABLE test DROP COLUMN v1, alter v1 SET DEFAULT 5000",
@@ -2191,7 +2456,7 @@ var ScriptTests = []ScriptTest{
 		Assertions: []ScriptTestAssertion{
 			{
 				Query:    "alter table test alter column j set default ('[]');",
-				Expected: []sql.Row{},
+				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
 				Query: "show create table test",
@@ -3444,6 +3709,39 @@ var ScriptTests = []ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "UNIX_TIMESTAMP function usage with session different time zones",
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SET time_zone = '+07:00';",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "SELECT UNIX_TIMESTAMP('2023-09-25 07:02:57');",
+				Expected: []sql.Row{{float64(1695600177)}},
+			},
+			{
+				Query:    "SELECT UNIX_TIMESTAMP(CONVERT_TZ('2023-09-25 07:02:57', '+00:00', @@session.time_zone));",
+				Expected: []sql.Row{{float64(1695625377)}},
+			},
+			{
+				Query:    "SET time_zone = '+00:00';",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "SELECT UNIX_TIMESTAMP('2023-09-25 07:02:57');",
+				Expected: []sql.Row{{float64(1695625377)}},
+			},
+			{
+				Query:    "SET time_zone = '-06:00';",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "SELECT UNIX_TIMESTAMP('2023-09-25 07:02:57');",
+				Expected: []sql.Row{{float64(1695646977)}},
+			},
+		},
+	},
 }
 
 var SpatialScriptTests = []ScriptTest{
@@ -4294,7 +4592,7 @@ var PreparedScriptTests = []ScriptTest{
 			},
 			{
 				Query:          "execute s",
-				ExpectedErrStr: "missing bind var v1",
+				ExpectedErrStr: "bind variable not provided: 'v1'",
 			},
 			{
 				Query: "execute s using @abc",
@@ -4352,7 +4650,7 @@ var PreparedScriptTests = []ScriptTest{
 			},
 			{
 				Query:          "execute s using @a",
-				ExpectedErrStr: "missing bind var v2",
+				ExpectedErrStr: "bind variable not provided: 'v2'",
 			},
 			{
 				Query: "execute s using @a, @b",
@@ -4767,6 +5065,27 @@ var BrokenScriptTests = []ScriptTest{
 			{
 				Query:    "show warnings;",
 				Expected: []sql.Row{{"Warning", 1356, "View 'v1' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them"}},
+			},
+		},
+	},
+	{
+		Name: "TIMESTAMP type value should be converted from session TZ to UTC TZ to be stored",
+		SetUpScript: []string{
+			"CREATE TABLE timezone_test (ts TIMESTAMP, dt DATETIME)",
+			"INSERT INTO timezone_test VALUES ('2023-02-14 08:47', '2023-02-14 08:47');",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SET SESSION time_zone = '-05:00';",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "SELECT DATE_FORMAT(ts, '%H:%i:%s'), DATE_FORMAT(dt, '%H:%i:%s') from timezone_test;",
+				Expected: []sql.Row{{"11:47:00", "08:47:00"}},
+			},
+			{
+				Query:    "SELECT UNIX_TIMESTAMP(ts), UNIX_TIMESTAMP(dt) from timezone_test;",
+				Expected: []sql.Row{{float64(1676393220), float64(1676382420)}},
 			},
 		},
 	},

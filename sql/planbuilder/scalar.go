@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -12,6 +26,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/encodings"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/expression/function"
+	"github.com/dolthub/go-mysql-server/sql/expression/function/json"
 	"github.com/dolthub/go-mysql-server/sql/fulltext"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -46,6 +61,11 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 		return &function.Substring{Str: name, Start: start, Len: len}
 	case *ast.CurTimeFuncExpr:
 		fsp := b.buildScalar(inScope, v.Fsp)
+
+		if inScope.parent.activeSubquery != nil {
+			inScope.parent.activeSubquery.markVolatile()
+		}
+
 		return &function.CurrTimestamp{Args: []sql.Expression{fsp}}
 	case *ast.TrimExpr:
 		pat := b.buildScalar(inScope, v.Pattern)
@@ -93,6 +113,7 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 		return c.scalarGf()
 	case *ast.FuncExpr:
 		name := v.Name.Lowered()
+
 		if isAggregateFunc(name) && v.Over == nil {
 			// TODO this assumes aggregate is in the same scope
 			// also need to avoid nested aggregates
@@ -126,6 +147,10 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 			args[0] = expression.NewDistinctExpression(args[0])
 		}
 
+		if _, ok := rf.(sql.NonDeterministicExpression); ok && inScope.nearestSubquery() != nil {
+			inScope.nearestSubquery().markVolatile()
+		}
+
 		return rf
 
 	case *ast.GroupConcatExpr:
@@ -147,12 +172,11 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 		return expression.NewXor(lhs, rhs)
 	case *ast.ConvertUsingExpr:
 		expr := b.buildScalar(inScope, v.Expr)
-		collation, err := sql.ParseCollation(&v.Type, nil, false)
+		charset, err := sql.ParseCharacterSet(v.Type)
 		if err != nil {
 			b.handleErr(err)
 		}
-
-		return expression.NewCollatedExpression(expr, collation)
+		return expression.NewConvertUsing(expr, charset)
 	case *ast.ConvertExpr:
 		var err error
 		typeLength := 0
@@ -173,7 +197,12 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 			}
 		}
 		expr := b.buildScalar(inScope, v.Expr)
-		return expression.NewConvertWithLengthAndScale(expr, v.Type.Type, typeLength, typeScale)
+		ret, err := b.f.buildConvert(expr, v.Type.Type, typeLength, typeScale)
+		if err != nil {
+			b.handleErr(err)
+		}
+		return ret
+
 	case *ast.RangeCond:
 		val := b.buildScalar(inScope, v.Left)
 		lower := b.buildScalar(inScope, v.From)
@@ -200,12 +229,15 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 	case *ast.UnaryExpr:
 		return b.buildUnaryScalar(inScope, v)
 	case *ast.Subquery:
-		sqScope := inScope.push()
+		sqScope := inScope.pushSubquery()
 		selectString := ast.String(v.Select)
-		sqScope.subquery = true
 		selScope := b.buildSelectStmt(sqScope, v.Select)
 		// TODO: get the original select statement, not the reconstruction
 		sq := plan.NewSubquery(selScope.node, selectString)
+		sq = sq.WithCorrelated(sqScope.correlated())
+		if b.TriggerCtx().Active {
+			sq = sq.WithVolatile()
+		}
 		return sq
 	case *ast.CaseExpr:
 		return b.buildCaseExpr(inScope, v)
@@ -229,7 +261,9 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 		return expression.NewCollatedExpression(innerExpr, collation)
 	case *ast.ValuesFuncExpr:
 		if b.insertActive {
-			v.Name.Qualifier.Name = ast.NewTableIdent(OnDupValuesPrefix)
+			if v.Name.Qualifier.Name.String() == "" {
+				v.Name.Qualifier.Name = ast.NewTableIdent(OnDupValuesPrefix)
+			}
 			tableName := strings.ToLower(v.Name.Qualifier.Name.String())
 			colName := strings.ToLower(v.Name.Name.String())
 			col, ok := inScope.resolveColumn(tableName, colName, false)
@@ -252,9 +286,11 @@ func (b *Builder) buildScalar(inScope *scope, e ast.Expr) sql.Expression {
 		}
 	case *ast.ExistsExpr:
 		sqScope := inScope.push()
+		sqScope.initSubquery()
 		selScope := b.buildSelectStmt(sqScope, v.Subquery.Select)
 		selectString := ast.String(v.Subquery.Select)
 		sq := plan.NewSubquery(selScope.node, selectString)
+		sq = sq.WithCorrelated(sqScope.correlated())
 		return plan.NewExistsSubquery(sq)
 	case *ast.TimestampFuncExpr:
 		var (
@@ -410,13 +446,13 @@ func (b *Builder) buildBinaryScalar(inScope *scope, be *ast.BinaryExpr) sql.Expr
 		}
 
 	case ast.JSONExtractOp, ast.JSONUnquoteExtractOp:
-		jsonExtract, err := function.NewJSONExtract(l, r)
+		jsonExtract, err := json.NewJSONExtract(l, r)
 		if err != nil {
 			b.handleErr(err)
 		}
 
 		if operator == ast.JSONUnquoteExtractOp {
-			return function.NewJSONUnquote(jsonExtract)
+			return json.NewJSONUnquote(jsonExtract)
 		}
 		return jsonExtract
 
@@ -424,79 +460,6 @@ func (b *Builder) buildBinaryScalar(inScope *scope, be *ast.BinaryExpr) sql.Expr
 		err := sql.ErrUnsupportedFeature.New(be.Operator)
 		b.handleErr(err)
 	}
-	return nil
-}
-
-func (b *Builder) buildLiteral(inScope *scope, v *ast.SQLVal) sql.Expression {
-	switch v.Type {
-	case ast.StrVal:
-		return expression.NewLiteral(string(v.Val), types.CreateLongText(b.ctx.GetCollation()))
-	case ast.IntVal:
-		return b.convertInt(string(v.Val), 10)
-	case ast.FloatVal:
-		val, err := strconv.ParseFloat(string(v.Val), 64)
-		if err != nil {
-			b.handleErr(err)
-		}
-
-		// use the value as string format to keep precision and scale as defined for DECIMAL data type to avoid rounded up float64 value
-		if ps := strings.Split(string(v.Val), "."); len(ps) == 2 {
-			ogVal := string(v.Val)
-			floatVal := fmt.Sprintf("%v", val)
-			if len(ogVal) >= len(floatVal) && ogVal != floatVal {
-				p, s := expression.GetDecimalPrecisionAndScale(ogVal)
-				dt, err := types.CreateDecimalType(p, s)
-				if err != nil {
-					return expression.NewLiteral(string(v.Val), types.CreateLongText(b.ctx.GetCollation()))
-				}
-				dVal, _, err := dt.Convert(ogVal)
-				if err != nil {
-					return expression.NewLiteral(string(v.Val), types.CreateLongText(b.ctx.GetCollation()))
-				}
-				return expression.NewLiteral(dVal, dt)
-			}
-		}
-
-		return expression.NewLiteral(val, types.Float64)
-	case ast.HexNum:
-		//TODO: binary collation?
-		v := strings.ToLower(string(v.Val))
-		if strings.HasPrefix(v, "0x") {
-			v = v[2:]
-		} else if strings.HasPrefix(v, "x") {
-			v = strings.Trim(v[1:], "'")
-		}
-
-		valBytes := []byte(v)
-		dst := make([]byte, hex.DecodedLen(len(valBytes)))
-		_, err := hex.Decode(dst, valBytes)
-		if err != nil {
-			b.handleErr(err)
-		}
-		return expression.NewLiteral(dst, types.LongBlob)
-	case ast.HexVal:
-		//TODO: binary collation?
-		val, err := v.HexDecode()
-		if err != nil {
-			b.handleErr(err)
-		}
-		return expression.NewLiteral(val, types.LongBlob)
-	case ast.ValArg:
-		return expression.NewBindVar(strings.TrimPrefix(string(v.Val), ":"))
-	case ast.BitVal:
-		if len(v.Val) == 0 {
-			return expression.NewLiteral(0, types.Uint64)
-		}
-
-		res, err := strconv.ParseUint(string(v.Val), 2, 64)
-		if err != nil {
-			b.handleErr(err)
-		}
-
-		return expression.NewLiteral(res, types.Uint64)
-	}
-
-	b.handleErr(sql.ErrInvalidSQLValType.New(v.Type))
 	return nil
 }
 
@@ -655,13 +618,13 @@ func (b *Builder) binaryExprToExpression(inScope *scope, be *ast.BinaryExpr) (sq
 		}
 
 	case ast.JSONExtractOp, ast.JSONUnquoteExtractOp:
-		jsonExtract, err := function.NewJSONExtract(l, r)
+		jsonExtract, err := json.NewJSONExtract(l, r)
 		if err != nil {
 			return nil, err
 		}
 
 		if operator == ast.JSONUnquoteExtractOp {
-			return function.NewJSONUnquote(jsonExtract), nil
+			return json.NewJSONUnquote(jsonExtract), nil
 		}
 		return jsonExtract, nil
 
@@ -802,7 +765,15 @@ func (b *Builder) ConvertVal(v *ast.SQLVal) sql.Expression {
 		}
 		return expression.NewLiteral(val, types.LongBlob)
 	case ast.ValArg:
-		return expression.NewBindVar(strings.TrimPrefix(string(v.Val), ":"))
+		name := strings.TrimPrefix(string(v.Val), ":")
+		if b.bindCtx != nil {
+			if b.bindCtx.resolveOnly {
+				return expression.NewBindVar(name)
+			}
+			replacement := b.normalizeValArg(v)
+			return b.buildScalar(&scope{}, replacement)
+		}
+		return expression.NewBindVar(name)
 	case ast.BitVal:
 		if len(v.Val) == 0 {
 			return expression.NewLiteral(0, types.Uint64)
@@ -830,6 +801,10 @@ func (b *Builder) ConvertVal(v *ast.SQLVal) sql.Expression {
 // filter, since we only need to load the tables once. All steps after this
 // one can assume that the expression has been fully resolved and is valid.
 func (b *Builder) buildMatchAgainst(inScope *scope, v *ast.MatchExpr) *expression.MatchAgainst {
+	//TODO: implement proper scope support and remove this check
+	if (inScope.groupBy != nil && inScope.groupBy.hasAggs()) || inScope.windowFuncs != nil {
+		b.handleErr(fmt.Errorf("aggregate and window functions are not yet supported alongside MATCH expressions"))
+	}
 	rts := getTablesByName(inScope.node)
 	var rt *plan.ResolvedTable
 	var matchTable string

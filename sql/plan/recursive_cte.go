@@ -43,7 +43,7 @@ import (
 // projection count and types. [Init] will be resolved before
 // [Rec] or [RecursiveCte] to share schema types.
 type RecursiveCte struct {
-	union *Union
+	union *SetOp
 	// Columns used to name lazily-loaded schema fields
 	Columns []string
 	// schema will match the types of [Init.Schema()], names of [Columns]
@@ -61,7 +61,8 @@ var _ sql.CollationCoercible = (*RecursiveCte)(nil)
 func NewRecursiveCte(initial, recursive sql.Node, name string, outputCols []string, deduplicate bool, l sql.Expression, sf sql.SortFields) *RecursiveCte {
 	return &RecursiveCte{
 		Columns: outputCols,
-		union: &Union{
+		union: &SetOp{
+			SetOpType:  UnionType,
 			BinaryNode: BinaryNode{left: initial, right: recursive},
 			Distinct:   deduplicate,
 			Limit:      l,
@@ -76,6 +77,10 @@ func (r *RecursiveCte) Name() string {
 	return r.name
 }
 
+func (r *RecursiveCte) IsReadOnly() bool {
+	return r.union.BinaryNode.left.IsReadOnly() && r.union.BinaryNode.right.IsReadOnly()
+}
+
 // Left implements sql.BinaryNode
 func (r *RecursiveCte) Left() sql.Node {
 	return r.union.left
@@ -86,7 +91,7 @@ func (r *RecursiveCte) Right() sql.Node {
 	return r.union.right
 }
 
-func (r *RecursiveCte) Union() *Union {
+func (r *RecursiveCte) Union() *SetOp {
 	return r.union
 }
 
@@ -112,11 +117,11 @@ func (r *RecursiveCte) Schema() sql.Schema {
 // WithChildren implements sql.Node
 func (r *RecursiveCte) WithChildren(children ...sql.Node) (sql.Node, error) {
 	ret := *r
-	u, err := r.union.WithChildren(children...)
+	s, err := r.union.WithChildren(children...)
 	if err != nil {
 		return nil, err
 	}
-	ret.union = u.(*Union)
+	ret.union = s.(*SetOp)
 	return &ret, nil
 }
 
@@ -147,11 +152,11 @@ func (r *RecursiveCte) Expressions() []sql.Expression {
 
 func (r *RecursiveCte) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
 	ret := *r
-	u, err := r.union.WithExpressions(exprs...)
+	s, err := r.union.WithExpressions(exprs...)
 	if err != nil {
 		return nil, err
 	}
-	ret.union = u.(*Union)
+	ret.union = s.(*SetOp)
 	return &ret, nil
 }
 
@@ -213,6 +218,10 @@ func (r *RecursiveTable) Resolved() bool {
 
 func (r *RecursiveTable) Name() string {
 	return r.name
+}
+
+func (r *RecursiveTable) IsReadOnly() bool {
+	return true
 }
 
 func (r *RecursiveTable) String() string {

@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	gmstime "github.com/dolthub/go-mysql-server/internal/time"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 	"github.com/dolthub/go-mysql-server/sql/plan"
@@ -702,7 +703,7 @@ func (b *BaseBuilder) buildShowCreateTable(ctx *sql.Context, n *plan.ShowCreateT
 		table:    n.Child,
 		isView:   n.IsView,
 		indexes:  n.Indexes,
-		checks:   n.Checks,
+		checks:   n.Checks(),
 		schema:   n.TargetSchema(),
 		pkSchema: n.PrimaryKeySchema,
 	}, nil
@@ -786,4 +787,34 @@ func (b *BaseBuilder) buildShowReplicaStatus(ctx *sql.Context, n *plan.ShowRepli
 	}
 
 	return sql.RowsToRowIter(row), nil
+}
+
+func (b *BaseBuilder) buildShowCreateEvent(ctx *sql.Context, n *plan.ShowCreateEvent, row sql.Row) (sql.RowIter, error) {
+	characterSetClient, err := ctx.GetSessionVariable(ctx, "character_set_client")
+	if err != nil {
+		return nil, err
+	}
+	collationConnection, err := ctx.GetSessionVariable(ctx, "collation_connection")
+	if err != nil {
+		return nil, err
+	}
+	collationServer, err := ctx.GetSessionVariable(ctx, "collation_server")
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert the Event's timestamps into the session's timezone (they are always stored in UTC)
+	newEvent := n.Event.ConvertTimesFromUTCToTz(gmstime.SystemTimezoneOffset())
+	n.Event = *newEvent
+
+	// TODO: fill time_zone with appropriate values
+	return sql.RowsToRowIter(sql.Row{
+		n.Event.Name,                   // Event
+		n.Event.SqlMode,                // sql_mode
+		"SYSTEM",                       // time_zone
+		n.Event.CreateEventStatement(), // Create Event
+		characterSetClient,             // character_set_client
+		collationConnection,            // collation_connection
+		collationServer,                // Database Collation
+	}), nil
 }

@@ -20,12 +20,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dolthub/vitess/go/sqltypes"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/pkg/errors"
 
+	"github.com/dolthub/go-mysql-server/eventscheduler"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	"github.com/dolthub/go-mysql-server/sql/expression"
@@ -71,20 +73,20 @@ type TemporaryUser struct {
 
 // PreparedDataCache manages all the prepared data for every session for every query for an engine
 type PreparedDataCache struct {
-	data map[uint32]map[string]*sqlparser.ParsedQuery
+	data map[uint32]map[string]sqlparser.Statement
 	mu   *sync.Mutex
 }
 
 func NewPreparedDataCache() *PreparedDataCache {
 	return &PreparedDataCache{
-		data: make(map[uint32]map[string]*sqlparser.ParsedQuery),
+		data: make(map[uint32]map[string]sqlparser.Statement),
 		mu:   &sync.Mutex{},
 	}
 }
 
 // GetCachedStmt will retrieve the prepared sql.Node associated with the ctx.SessionId and query if it exists
 // it will return nil, false if the query does not exist
-func (p *PreparedDataCache) GetCachedStmt(sessId uint32, query string) (*sqlparser.ParsedQuery, bool) {
+func (p *PreparedDataCache) GetCachedStmt(sessId uint32, query string) (sqlparser.Statement, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sessData, ok := p.data[sessId]; ok {
@@ -95,7 +97,7 @@ func (p *PreparedDataCache) GetCachedStmt(sessId uint32, query string) (*sqlpars
 }
 
 // GetSessionData returns all the prepared queries for a particular session
-func (p *PreparedDataCache) GetSessionData(sessId uint32) map[string]*sqlparser.ParsedQuery {
+func (p *PreparedDataCache) GetSessionData(sessId uint32) map[string]sqlparser.Statement {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.data[sessId]
@@ -113,10 +115,9 @@ func (p *PreparedDataCache) CacheStmt(sessId uint32, query string, stmt sqlparse
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.data[sessId]; !ok {
-		p.data[sessId] = make(map[string]*sqlparser.ParsedQuery)
+		p.data[sessId] = make(map[string]sqlparser.Statement)
 	}
-	prep := sqlparser.NewParsedQuery(stmt)
-	p.data[sessId][query] = prep
+	p.data[sessId][query] = stmt
 }
 
 // UncacheStmt removes the prepared node associated with a ctx.SessionId and query to it
@@ -136,10 +137,12 @@ type Engine struct {
 	ProcessList       sql.ProcessList
 	MemoryManager     *sql.MemoryManager
 	BackgroundThreads *sql.BackgroundThreads
-	IsReadOnly        bool
+	ReadOnly          atomic.Bool
 	IsServerLocked    bool
 	PreparedDataCache *PreparedDataCache
 	mu                *sync.Mutex
+	Version           sql.AnalyzerVersion
+	EventScheduler    *eventscheduler.EventScheduler
 }
 
 type ColumnWithRawDefault struct {
@@ -168,17 +171,19 @@ func New(a *analyzer.Analyzer, cfg *Config) *Engine {
 	})
 	a.Catalog.RegisterFunction(emptyCtx, function.GetLockingFuncs(ls)...)
 
-	return &Engine{
+	ret := &Engine{
 		Analyzer:          a,
 		MemoryManager:     sql.NewMemoryManager(sql.ProcessMemory),
 		ProcessList:       NewProcessList(),
 		LS:                ls,
 		BackgroundThreads: sql.NewBackgroundThreads(),
-		IsReadOnly:        cfg.IsReadOnly,
 		IsServerLocked:    cfg.IsServerLocked,
 		PreparedDataCache: NewPreparedDataCache(),
 		mu:                &sync.Mutex{},
+		EventScheduler:    nil,
 	}
+	ret.ReadOnly.Store(cfg.IsReadOnly)
+	return ret
 }
 
 // NewDefault creates a new default Engine.
@@ -204,15 +209,16 @@ func (e *Engine) PrepareQuery(
 	ctx *sql.Context,
 	query string,
 ) (sql.Node, error) {
-	sqlMode, err := sql.LoadSqlMode(ctx)
-	if err != nil {
-		return nil, err
-	}
-	node, err := planbuilder.ParseWithOptions(ctx, e.Analyzer.Catalog, query, sqlMode.ParserOptions())
-	if err != nil {
-		return nil, err
-	}
+	sqlMode := sql.LoadSqlMode(ctx)
+
 	stmt, _, err := sqlparser.ParseOneWithOptions(query, sqlMode.ParserOptions())
+	if err != nil {
+		return nil, err
+	}
+
+	binder := planbuilder.New(ctx, e.Analyzer.Catalog)
+	node, err := binder.BindOnly(stmt, query)
+
 	if err != nil {
 		return nil, err
 	}
@@ -223,12 +229,7 @@ func (e *Engine) PrepareQuery(
 
 // Query executes a query.
 func (e *Engine) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error) {
-	return e.QueryWithBindings(ctx, query, nil)
-}
-
-// QueryWithBindings executes the query given with the bindings provided
-func (e *Engine) QueryWithBindings(ctx *sql.Context, query string, bindings map[string]*querypb.BindVariable) (sql.Schema, sql.RowIter, error) {
-	return e.QueryNodeWithBindings(ctx, query, nil, bindings)
+	return e.QueryWithBindings(ctx, query, nil, nil)
 }
 
 func bindingsToExprs(bindings map[string]*querypb.BindVariable) (map[string]sql.Expression, error) {
@@ -341,16 +342,14 @@ func bindingsToExprs(bindings map[string]*querypb.BindVariable) (map[string]sql.
 	return res, nil
 }
 
-// QueryNodeWithBindings executes the query given with the bindings provided. If parsed is non-nil, it will be used
+// QueryWithBindings executes the query given with the bindings provided. If parsed is non-nil, it will be used
 // instead of parsing the query from text.
-func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sqlparser.Statement, bindings map[string]*querypb.BindVariable) (sql.Schema, sql.RowIter, error) {
+func (e *Engine) QueryWithBindings(ctx *sql.Context, query string, parsed sqlparser.Statement, bindings map[string]*querypb.BindVariable) (sql.Schema, sql.RowIter, error) {
 	var err error
+	binder := planbuilder.New(ctx, e.Analyzer.Catalog)
 	if prep, ok := e.PreparedDataCache.GetCachedStmt(ctx.Session.ID(), query); ok {
-		parsed = nil
-		query, err = prep.GenerateQuery(bindings, nil)
-		if err != nil {
-			return nil, nil, err
-		}
+		parsed = prep
+		binder.SetBindings(bindings)
 	} else if len(bindings) > 0 {
 		parsed = nil
 		_, err := e.PrepareQuery(ctx, query)
@@ -359,11 +358,12 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 		}
 		prep, ok := e.PreparedDataCache.GetCachedStmt(ctx.Session.ID(), query)
 		if ok {
-			query, err = prep.GenerateQuery(bindings, nil)
-			if err != nil {
-				return nil, nil, err
-			}
+			parsed = prep
+			binder.SetBindings(bindings)
 		}
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Give the integrator a chance to reject the session before proceeding
@@ -377,7 +377,6 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 		return nil, nil, err
 	}
 
-	sqlMode, err := sql.LoadSqlMode(ctx)
 	if err != nil {
 		err2 := clearAutocommitTransaction(ctx)
 		if err2 != nil {
@@ -387,7 +386,7 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 	}
 	var bound sql.Node
 	if parsed == nil {
-		bound, err = planbuilder.ParseWithOptions(ctx, e.Analyzer.Catalog, query, sqlMode.ParserOptions())
+		bound, err = binder.ParseOne(query)
 		if err != nil {
 			err2 := clearAutocommitTransaction(ctx)
 			if err2 != nil {
@@ -396,11 +395,7 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 			return nil, nil, err
 		}
 	} else {
-		b, err := planbuilder.New(ctx, e.Analyzer.Catalog)
-		if err != nil {
-			return nil, nil, err
-		}
-		bound, err = b.BindOnly(parsed, query)
+		bound, err = binder.BindOnly(parsed, query)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -440,11 +435,8 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 				bindings[fmt.Sprintf("v%d", i)] = sqltypes.StringBindVariable(name.String())
 			}
 		}
-		query, err = prep.GenerateQuery(bindings, nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		bound, err = planbuilder.ParseWithOptions(ctx, e.Analyzer.Catalog, query, sqlMode.ParserOptions())
+		binder.SetBindings(bindings)
+		bound, err = binder.BindOnly(prep, query)
 		if err != nil {
 			err2 := clearAutocommitTransaction(ctx)
 			if err2 != nil {
@@ -455,16 +447,13 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 		}
 	}
 
-	err = e.readOnlyCheck(bound)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	// TODO: eventually, we should have this logic be in the RowIter() of the respective plans
 	// along with a new rule that handles analysis
 	var analyzed sql.Node
 	switch n := bound.(type) {
 	case *plan.PrepareQuery:
+		sqlMode := sql.LoadSqlMode(ctx)
+
 		// we have to name-resolve to check for structural errors, but we do
 		// not to cache the name-bound query yet.
 		//todo(max): improve name resolution so we can cache post name-binding.
@@ -508,6 +497,17 @@ func (e *Engine) QueryNodeWithBindings(ctx *sql.Context, query string, parsed sq
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+
+	if bindCtx := binder.BindCtx(); bindCtx != nil {
+		if unused := bindCtx.UnusedBindings(); len(unused) > 0 {
+			return nil, nil, fmt.Errorf("invalid arguments. expected: %d, found: %d", len(bindCtx.Bindings)-len(unused), len(bindCtx.Bindings))
+		}
+	}
+
+	err = e.readOnlyCheck(analyzed)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if err != nil {
@@ -624,6 +624,9 @@ func (e *Engine) beginTransaction(ctx *sql.Context) error {
 }
 
 func (e *Engine) Close() error {
+	if e.EventScheduler != nil {
+		e.EventScheduler.Close()
+	}
 	for _, p := range e.ProcessList.Processes() {
 		e.ProcessList.Kill(p.Connection)
 	}
@@ -635,23 +638,108 @@ func (e *Engine) WithBackgroundThreads(b *sql.BackgroundThreads) *Engine {
 	return e
 }
 
+func (e *Engine) IsReadOnly() bool {
+	return e.ReadOnly.Load()
+}
+
 // readOnlyCheck checks to see if the query is valid with the modification setting of the engine.
 func (e *Engine) readOnlyCheck(node sql.Node) error {
-	if plan.IsDDLNode(node) {
-		if e.IsReadOnly {
-			return sql.ErrReadOnly.New()
-		} else if e.IsServerLocked {
-			return sql.ErrDatabaseWriteLocked.New()
-		}
+	// Note: We only compute plan.IsReadOnly if the server is in one of
+	// these two modes, since otherwise it is simply wasted work.
+	if e.IsReadOnly() && !plan.IsReadOnly(node) {
+		return sql.ErrReadOnly.New()
 	}
-	switch node.(type) {
-	case
-		*plan.DeleteFrom, *plan.InsertInto, *plan.Update, *plan.LockTables, *plan.UnlockTables:
-		if e.IsReadOnly {
-			return sql.ErrReadOnly.New()
-		} else if e.IsServerLocked {
-			return sql.ErrDatabaseWriteLocked.New()
-		}
+	if e.IsServerLocked && !plan.IsReadOnly(node) {
+		return sql.ErrDatabaseWriteLocked.New()
 	}
 	return nil
+}
+
+func (e *Engine) EnginePreparedDataCache() *PreparedDataCache {
+	return e.PreparedDataCache
+}
+
+func (e *Engine) EngineAnalyzer() *analyzer.Analyzer {
+	return e.Analyzer
+}
+
+// InitializeEventScheduler initializes the EventScheduler for the engine with the given sql.Context
+// getter function, |ctxGetterFunc, the EventScheduler |status|, and the |period| for the event scheduler
+// to check for events to execute. If |period| is less than 1, then it is ignored and the default period
+// (30s currently) is used. This function also initializes the EventScheduler of the analyzer of this engine.
+func (e *Engine) InitializeEventScheduler(ctxGetterFunc func() (*sql.Context, func() error, error), status eventscheduler.SchedulerStatus, period int) error {
+	var err error
+	e.EventScheduler, err = eventscheduler.InitEventScheduler(e.Analyzer, e.BackgroundThreads, ctxGetterFunc, status, e.executeEvent, period)
+	if err != nil {
+		return err
+	}
+
+	e.Analyzer.EventScheduler = e.EventScheduler
+	return nil
+}
+
+// executeEvent executes an event with this Engine. The event is executed against the |dbName| database, and by the
+// account identified by |username| and |address|. The entire CREATE EVENT statement is passed in as the |createEventStatement|
+// parameter, but only the body of the event is executed. (The CREATE EVENT statement is passed in to support event
+// bodies that contain multiple statements in a BEGIN/END block.) If any problems are encounterd, the error return
+// value will be populated.
+func (e *Engine) executeEvent(ctx *sql.Context, dbName, createEventStatement, username, address string) error {
+	// the event must be executed against the correct database and with the definer's identity
+	ctx.SetCurrentDatabase(dbName)
+	ctx.Session.SetClient(sql.Client{User: username, Address: address})
+
+	// Analyze the CREATE EVENT statement
+	planTree, err := e.AnalyzeQuery(ctx, createEventStatement)
+	if err != nil {
+		return err
+	}
+
+	// and pull out the event body/definition
+	createEventNode, err := findCreateEventNode(planTree)
+	if err != nil {
+		return err
+	}
+	definitionNode := createEventNode.DefinitionNode
+
+	// Build an iterator to execute the event body
+	iter, err := e.Analyzer.ExecBuilder.Build(ctx, definitionNode, nil)
+	if err != nil {
+		clearAutocommitErr := clearAutocommitTransaction(ctx)
+		if clearAutocommitErr != nil {
+			return clearAutocommitErr
+		}
+		return err
+	}
+	iter = rowexec.AddExpressionCloser(definitionNode, iter)
+
+	// Drain the iterate to execute the event body/definition
+	// NOTE: No row data is returned for an event; we just need to execute the statements
+	_, err = sql.RowIterToRows(ctx, definitionNode.Schema(), iter)
+	return err
+}
+
+// findCreateEventNode searches |planTree| for the first plan.CreateEvent node and
+// returns it. If no matching node was found, the returned CreateEvent node will be
+// nil and an error will be populated.
+func findCreateEventNode(planTree sql.Node) (*plan.CreateEvent, error) {
+	// Search through the node to find the first CREATE EVENT node, and then grab its body
+	var targetNode sql.Node
+	transform.Inspect(planTree, func(node sql.Node) bool {
+		if cen, ok := node.(*plan.CreateEvent); ok {
+			targetNode = cen
+			return false
+		}
+		return true
+	})
+
+	if targetNode == nil {
+		return nil, fmt.Errorf("unable to find create event node in plan tree: %v", planTree)
+	}
+
+	createEventNode, ok := targetNode.(*plan.CreateEvent)
+	if !ok {
+		return nil, fmt.Errorf("unable to find create event node in plan tree: %v", planTree)
+	}
+
+	return createEventNode, nil
 }

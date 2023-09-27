@@ -1,7 +1,22 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +46,51 @@ func TestPlanBuilder(t *testing.T) {
 
 	var tests = []planTest{
 		{
+			Query: "SELECT b.y as s1, a.y as s2, first_value(a.z) over (partition by a.y) from xy a join xy b on a.y = b.y",
+			ExpectedPlan: `
+Project
+ ├─ columns: [b.y:5!null as s1, a.y:2!null as s2, first_value(a.z) over ( partition by a.y rows between unbounded preceding and unbounded following):9!null as first_value(a.z) over (partition by a.y)]
+ └─ Window
+     ├─ first_value(a.z) over ( partition by a.y ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+     ├─ b.y:5!null
+     ├─ a.y:2!null
+     └─ InnerJoin
+         ├─ Eq
+         │   ├─ a.y:2!null
+         │   └─ b.y:5!null
+         ├─ TableAlias(a)
+         │   └─ Table
+         │       ├─ name: xy
+         │       └─ columns: [x y z]
+         └─ TableAlias(b)
+             └─ Table
+                 ├─ name: xy
+                 └─ columns: [x y z]
+`,
+		},
+		{
+			Query: "select a.x, b.y as s1, a.y as s2 from xy a join xy b on a.y = b.y group by b.y",
+			ExpectedPlan: `
+Project
+ ├─ columns: [a.x:1!null, b.y:5!null as s1, a.y:2!null as s2]
+ └─ GroupBy
+     ├─ select: a.x:1!null, b.y:5!null, a.y:2!null
+     ├─ group: b.y:5!null
+     └─ InnerJoin
+         ├─ Eq
+         │   ├─ a.y:2!null
+         │   └─ b.y:5!null
+         ├─ TableAlias(a)
+         │   └─ Table
+         │       ├─ name: xy
+         │       └─ columns: [x y z]
+         └─ TableAlias(b)
+             └─ Table
+                 ├─ name: xy
+                 └─ columns: [x y z]
+`,
+		},
+		{
 			Query: "with cte(y,x) as (select x,y from xy) select * from cte",
 			ExpectedPlan: `
 Project
@@ -38,7 +98,7 @@ Project
  └─ SubqueryAlias
      ├─ name: cte
      ├─ outerVisibility: false
-     ├─ cacheable: false
+     ├─ cacheable: true
      └─ Project
          ├─ columns: [xy.x:1!null, xy.y:2!null]
          └─ Table
@@ -178,7 +238,7 @@ Project
      └─ SubqueryAlias
          ├─ name: s
          ├─ outerVisibility: false
-         ├─ cacheable: false
+         ├─ cacheable: true
          └─ Project
              ├─ columns: [uv.u:4!null, uv.v:5!null, uv.w:6!null]
              └─ Table
@@ -196,6 +256,7 @@ Project
      │   ├─ left: xy.x:1!null
      │   └─ right: Subquery
      │       ├─ cacheable: false
+     │       ├─ alias-string: select u from uv where x = u
      │       └─ Project
      │           ├─ columns: [uv.u:4!null]
      │           └─ Filter
@@ -218,7 +279,7 @@ Project
  └─ SubqueryAlias
      ├─ name: cte
      ├─ outerVisibility: false
-     ├─ cacheable: false
+     ├─ cacheable: true
      └─ Project
          ├─ columns: [1 (tinyint)]
          └─ Table
@@ -234,7 +295,7 @@ Project
  └─ SubqueryAlias
      ├─ name: cte
      ├─ outerVisibility: false
-     ├─ cacheable: false
+     ├─ cacheable: true
      └─ RecursiveCTE
          └─ Union distinct
              ├─ Project
@@ -287,7 +348,7 @@ Project
 			ExpectedPlan: `
 Project
  ├─ columns: [xy.y:2!null, count(xy.x):4!null as count(x)]
- └─ Sort(COUNT(xy.x):4!null DESC nullsFirst)
+ └─ Sort(count(xy.x):4!null DESC nullsFirst)
      └─ GroupBy
          ├─ select: COUNT(xy.x:1!null), xy.y:2!null
          ├─ group: xy.y:2!null
@@ -420,7 +481,7 @@ Project
      └─ SubqueryAlias
          ├─ name: dt
          ├─ outerVisibility: false
-         ├─ cacheable: false
+         ├─ cacheable: true
          └─ Project
              ├─ columns: [count(1):4!null as count(*)]
              └─ GroupBy
@@ -439,7 +500,7 @@ Project
  └─ SubqueryAlias
      ├─ name: dt
      ├─ outerVisibility: false
-     ├─ cacheable: false
+     ├─ cacheable: true
      └─ Project
          ├─ columns: [count(1):4!null as s]
          └─ GroupBy
@@ -523,7 +584,7 @@ Project
  └─ Sort(xy.x:1!null ASC nullsFirst)
      └─ Having
          ├─ GreaterThan
-         │   ├─ AVG(xy.x):5
+         │   ├─ avg(xy.x):5
          │   └─ 1 (tinyint)
          └─ GroupBy
              ├─ select: AVG(xy.x:1!null), SUM(xy.x:1!null), xy.x:1!null
@@ -538,7 +599,7 @@ Project
 			ExpectedPlan: `
 Project
  ├─ columns: [xy.y:2!null, sum(xy.x):4!null as SUM(x)]
- └─ Sort((SUM(xy.x):4!null + 1 (tinyint)) ASC nullsFirst)
+ └─ Sort((sum(xy.x):4!null + 1 (tinyint)) ASC nullsFirst)
      └─ GroupBy
          ├─ select: SUM(xy.x:1!null), xy.y:2!null
          ├─ group: xy.y:2!null
@@ -566,7 +627,7 @@ Project
 			ExpectedPlan: `
 Project
  ├─ columns: [xy.y:2!null, sum(xy.x):4!null as SUM(x)]
- └─ Sort((SUM(xy.x):4!null % 2 (tinyint)) ASC nullsFirst, SUM(xy.x):4!null ASC nullsFirst, avg(xy.x):7 ASC nullsFirst)
+ └─ Sort((sum(xy.x):4!null % 2 (tinyint)) ASC nullsFirst, sum(xy.x):4!null ASC nullsFirst, avg(xy.x):7 ASC nullsFirst)
      └─ GroupBy
          ├─ select: AVG(xy.x:1!null), SUM(xy.x:1!null), xy.y:2!null
          ├─ group: xy.y:2!null
@@ -597,7 +658,7 @@ Project
  └─ Sort(xy.x:1!null ASC nullsFirst)
      └─ Having
          ├─ GreaterThan
-         │   ├─ AVG(xy.y):5
+         │   ├─ avg(xy.y):5
          │   └─ 1 (tinyint)
          └─ GroupBy
              ├─ select: AVG(xy.y:2!null), SUM(xy.x:1!null), xy.x:1!null, xy.y:2!null
@@ -615,7 +676,7 @@ Project
  └─ Sort(sum(xy.x):4!null as sum(x) ASC nullsFirst)
      └─ Having
          ├─ GreaterThan
-         │   ├─ AVG(xy.x):5
+         │   ├─ avg(xy.x):5
          │   └─ 1 (tinyint)
          └─ GroupBy
              ├─ select: AVG(xy.x:1!null), SUM(xy.x:1!null), xy.x:1!null
@@ -631,6 +692,7 @@ Project
 Project
  ├─ columns: [Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select u from uv where x = u
  │   └─ Project
  │       ├─ columns: [uv.u:4!null]
  │       └─ Filter
@@ -645,6 +707,7 @@ Project
      ├─ select: 
      ├─ group: Subquery
      │   ├─ cacheable: false
+     │   ├─ alias-string: select u from uv where x = u
      │   └─ Project
      │       ├─ columns: [uv.u:7!null]
      │       └─ Filter
@@ -686,6 +749,7 @@ Project
      │   ├─ xy.y:2!null
      │   └─ Subquery
      │       ├─ cacheable: false
+     │       ├─ alias-string: select dt.u from (select uv.u as u from uv where uv.v = xy.x) as dt
      │       └─ Project
      │           ├─ columns: [dt.u:8!null]
      │           └─ SubqueryAlias
@@ -716,6 +780,7 @@ Project
      │   ├─ xy.z:3!null
      │   └─ Subquery
      │       ├─ cacheable: false
+     │       ├─ alias-string: select dt.u from (select uv.u as u from uv where uv.v = xy.y) as dt
      │       └─ Project
      │           ├─ columns: [dt.u:8!null]
      │           └─ SubqueryAlias
@@ -744,6 +809,7 @@ Project
 Project
  ├─ columns: [Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select dt.z from (select uv.u as z from uv where uv.v = xy.y) as dt
  │   └─ Project
  │       ├─ columns: [dt.z:8!null]
  │       └─ SubqueryAlias
@@ -773,6 +839,7 @@ Project
 Project
  ├─ columns: [Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select max(dt.z) from (select uv.u as z from uv where uv.v = xy.y) as dt
  │   └─ Project
  │       ├─ columns: [max(dt.z):9!null]
  │       └─ GroupBy
@@ -805,6 +872,7 @@ Project
 Project
  ├─ columns: [xy.x:1!null, xy.y:2!null, xy.z:3!null, Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select max(dt.u) from (select uv.u as u from uv where uv.v = xy.y) as dt
  │   └─ Project
  │       ├─ columns: [max(dt.u):9!null]
  │       └─ GroupBy
@@ -925,6 +993,9 @@ Project
 
 
 
+
+
+
 			select
 			x,
 			x*y,
@@ -952,6 +1023,9 @@ Project
 		},
 		{
 			Query: `
+
+
+
 
 
 
@@ -993,6 +1067,9 @@ Project
 		},
 		{
 			Query: `
+
+
+
 
 
 
@@ -1065,7 +1142,7 @@ Project
 			ExpectedPlan: `
 Project
  ├─ columns: [xy.x:1!null, avg(xy.x):4 as avg(x)]
- └─ Sort(AVG(xy.x):4 ASC nullsFirst)
+ └─ Sort(avg(xy.x):4 ASC nullsFirst)
      └─ GroupBy
          ├─ select: AVG(xy.x:1!null), xy.x:1!null
          ├─ group: xy.x:1!null
@@ -1177,6 +1254,7 @@ Project
  └─ Having
      ├─ EXISTS Subquery
      │   ├─ cacheable: false
+     │   ├─ alias-string: select * from xy where y = s
      │   └─ Project
      │       ├─ columns: [xy.x:6!null, xy.y:7!null, xy.z:8!null]
      │       └─ Filter
@@ -1219,6 +1297,9 @@ Project
 
 
 
+
+
+
 			SELECT x
 			FROM xy
 			WHERE EXISTS (SELECT count(u) AS count_1
@@ -1231,11 +1312,12 @@ Project
  └─ Filter
      ├─ EXISTS Subquery
      │   ├─ cacheable: false
+     │   ├─ alias-string: select count(u) count_1 from uv where y = u group by u having count(u) > 1
      │   └─ Project
      │       ├─ columns: [count(uv.u):7!null as count_1]
      │       └─ Having
      │           ├─ GreaterThan
-     │           │   ├─ COUNT(uv.u):7!null
+     │           │   ├─ count(uv.u):7!null
      │           │   └─ 1 (tinyint)
      │           └─ Project
      │               ├─ columns: [count(uv.u):7!null, uv.u:4!null, count(uv.u):7!null as count_1]
@@ -1261,6 +1343,9 @@ Project
 
 
 
+
+
+
 			WITH RECURSIVE
 			rt (foo) AS (
 			SELECT 1 as foo
@@ -1280,7 +1365,7 @@ Project
  └─ SubqueryAlias
      ├─ name: ladder
      ├─ outerVisibility: false
-     ├─ cacheable: false
+     ├─ cacheable: true
      └─ RecursiveCTE
          └─ Union all
              ├─ Project
@@ -1288,7 +1373,7 @@ Project
              │   └─ SubqueryAlias
              │       ├─ name: rt
              │       ├─ outerVisibility: false
-             │       ├─ cacheable: false
+             │       ├─ cacheable: true
              │       └─ RecursiveCTE
              │           └─ Union all
              │               ├─ Project
@@ -1314,7 +1399,7 @@ Project
                          └─ SubqueryAlias
                              ├─ name: rt
                              ├─ outerVisibility: false
-                             ├─ cacheable: false
+                             ├─ cacheable: true
                              └─ RecursiveCTE
                                  └─ Union all
                                      ├─ Project
@@ -1347,6 +1432,7 @@ Project
 Project
  ├─ columns: [xy.x:1!null as alias1, Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select alias1 + 1 group by alias1 having alias1 > 0
  │   └─ Project
  │       ├─ columns: [(alias1:4!null + 1 (tinyint)) as alias1+1]
  │       └─ Having
@@ -1422,6 +1508,7 @@ Project
 Project
  ├─ columns: [(xy.x:1!null + 1 (tinyint)) as x, Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select x
  │   └─ Project
  │       ├─ columns: [xy.x:1!null]
  │       └─ Table
@@ -1437,6 +1524,9 @@ Project
 		},
 		{
 			Query: `
+
+
+
 
 
 
@@ -1457,7 +1547,7 @@ Project
          └─ SubqueryAlias
              ├─ name: t
              ├─ outerVisibility: false
-             ├─ cacheable: false
+             ├─ cacheable: true
              └─ Project
                  ├─ columns: [tbl.x:1!null as fi]
                  └─ TableAlias(tbl)
@@ -1508,6 +1598,7 @@ Project
 Project
  ├─ columns: [1 (tinyint) as a, Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select a
  │   └─ Project
  │       ├─ columns: [a:1!null]
  │       └─ Table
@@ -1517,6 +1608,7 @@ Project
  └─ Project
      ├─ columns: [1 (tinyint) as a, Subquery
      │   ├─ cacheable: false
+     │   ├─ alias-string: select a
      │   └─ Project
      │       ├─ columns: [a:1!null]
      │       └─ Table
@@ -1534,6 +1626,7 @@ Project
 Project
  ├─ columns: [max(xy.x):4!null as max(x), Subquery
  │   ├─ cacheable: false
+ │   ├─ alias-string: select max(dt.a) from (select x as a) as dt (a)
  │   └─ Project
  │       ├─ columns: [max(dt.a):7!null]
  │       └─ GroupBy
@@ -1552,6 +1645,7 @@ Project
  └─ Project
      ├─ columns: [max(xy.x):4!null, Subquery
      │   ├─ cacheable: false
+     │   ├─ alias-string: select max(dt.a) from (select x as a) as dt (a)
      │   └─ Project
      │       ├─ columns: [max(dt.a):7!null]
      │       └─ GroupBy
@@ -1571,6 +1665,7 @@ Project
          ├─ select: MAX(xy.x:1!null)
          ├─ group: Subquery
          │   ├─ cacheable: false
+         │   ├─ alias-string: select max(dt.a) from (select x as a) as dt (a)
          │   └─ Project
          │       ├─ columns: [max(dt.a):7!null]
          │       └─ GroupBy
@@ -1639,13 +1734,14 @@ Project
 		}()
 	}
 
-	ctx := sql.NewEmptyContext()
+	db := memory.NewDatabase("mydb")
+	cat := newTestCatalog(db)
+	pro := memory.NewDBProvider(db)
+	sess := memory.NewSession(sql.NewBaseSession(), pro)
+
+	ctx := sql.NewContext(context.Background(), sql.WithSession(sess))
 	ctx.SetCurrentDatabase("mydb")
-	cat := newTestCatalog()
-	b := &Builder{
-		ctx: ctx,
-		cat: cat,
-	}
+	b := New(ctx, cat)
 
 	for _, tt := range tests {
 		t.Run(tt.Query, func(t *testing.T) {
@@ -1656,7 +1752,7 @@ Project
 			require.NoError(t, err)
 
 			outScope := b.build(nil, stmt, tt.Query)
-			defer b.reset()
+			defer b.Reset()
 			plan := sql.DebugString(outScope.node)
 
 			if rewrite {
@@ -1678,27 +1774,26 @@ Project
 	}
 }
 
-func newTestCatalog() *sql.MapCatalog {
+func newTestCatalog(db *memory.Database) *sql.MapCatalog {
 	cat := &sql.MapCatalog{
 		Databases: make(map[string]sql.Database),
 		Tables:    make(map[string]sql.Table),
 	}
 
-	cat.Tables["xy"] = memory.NewTable("xy", sql.NewPrimaryKeySchema(sql.Schema{
+	cat.Tables["xy"] = memory.NewTable(db, "xy", sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: "x", Type: types.Int64},
 		{Name: "y", Type: types.Int64},
 		{Name: "z", Type: types.Int64},
 	}, 0), nil)
-	cat.Tables["uv"] = memory.NewTable("uv", sql.NewPrimaryKeySchema(sql.Schema{
+	cat.Tables["uv"] = memory.NewTable(db, "uv", sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: "u", Type: types.Int64},
 		{Name: "v", Type: types.Int64},
 		{Name: "w", Type: types.Int64},
 	}, 0), nil)
 
-	mydb := memory.NewDatabase("mydb")
-	mydb.AddTable("xy", cat.Tables["xy"])
-	mydb.AddTable("uv", cat.Tables["uv"])
-	cat.Databases["mydb"] = mydb
+	db.AddTable("xy", cat.Tables["xy"].(memory.MemTable))
+	db.AddTable("uv", cat.Tables["uv"].(memory.MemTable))
+	cat.Databases["mydb"] = db
 	cat.Funcs = function.NewRegistry()
 	return cat
 }
@@ -1713,7 +1808,24 @@ func TestParseColumnTypeString(t *testing.T) {
 			types.Int8,
 		},
 		{
+			"tinyint(0)",
+			types.Int8,
+		},
+		{
+			// MySQL 8.1.0 only honors display width for TINYINT and only when the display width is 1
+			"tinyint(1)",
+			types.MustCreateNumberTypeWithDisplayWidth(sqltypes.Int8, 1),
+		},
+		{
+			"tinyint(2)",
+			types.Int8,
+		},
+		{
 			"SMALLINT",
+			types.Int16,
+		},
+		{
+			"SMALLINT(1)",
 			types.Int16,
 		},
 		{
@@ -1721,7 +1833,15 @@ func TestParseColumnTypeString(t *testing.T) {
 			types.Int24,
 		},
 		{
+			"MEDIUMINT(1)",
+			types.Int24,
+		},
+		{
 			"INT",
+			types.Int32,
+		},
+		{
+			"INT(0)",
 			types.Int32,
 		},
 		{
@@ -1729,7 +1849,15 @@ func TestParseColumnTypeString(t *testing.T) {
 			types.Int64,
 		},
 		{
+			"BIGINT(1)",
+			types.Int64,
+		},
+		{
 			"TINYINT UNSIGNED",
+			types.Uint8,
+		},
+		{
+			"TINYINT(1) UNSIGNED",
 			types.Uint8,
 		},
 		{
@@ -1737,7 +1865,15 @@ func TestParseColumnTypeString(t *testing.T) {
 			types.Uint16,
 		},
 		{
+			"SMALLINT(1) UNSIGNED",
+			types.Uint16,
+		},
+		{
 			"MEDIUMINT UNSIGNED",
+			types.Uint24,
+		},
+		{
+			"MEDIUMINT(1) UNSIGNED",
 			types.Uint24,
 		},
 		{
@@ -1745,12 +1881,21 @@ func TestParseColumnTypeString(t *testing.T) {
 			types.Uint32,
 		},
 		{
+			"INT(1) UNSIGNED",
+			types.Uint32,
+		},
+		{
 			"BIGINT UNSIGNED",
 			types.Uint64,
 		},
 		{
+			"BIGINT(1) UNSIGNED",
+			types.Uint64,
+		},
+		{
+			// Boolean is a synonym for TINYINT(1)
 			"BOOLEAN",
-			types.Int8,
+			types.MustCreateNumberTypeWithDisplayWidth(sqltypes.Int8, 1),
 		},
 		{
 			"FLOAT",

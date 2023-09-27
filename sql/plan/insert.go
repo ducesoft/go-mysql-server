@@ -66,7 +66,7 @@ type InsertInto struct {
 	ColumnNames []string
 	IsReplace   bool
 	OnDupExprs  []sql.Expression
-	Checks      sql.CheckConstraints
+	checks      sql.CheckConstraints
 	Ignore      bool
 }
 
@@ -88,6 +88,19 @@ func NewInsertInto(db sql.Database, dst, src sql.Node, isReplace bool, cols []st
 		Ignore:      ignore,
 	}
 }
+
+var _ sql.CheckConstraintNode = (*RenameColumn)(nil)
+
+func (r *InsertInto) Checks() sql.CheckConstraints {
+	return r.checks
+}
+
+func (r *InsertInto) WithChecks(checks sql.CheckConstraints) sql.Node {
+	ret := *r
+	ret.checks = checks
+	return &ret
+}
+
 func (ii *InsertInto) Dispose() {
 	disposeNode(ii.Source)
 }
@@ -109,6 +122,10 @@ func (ii *InsertInto) Children() []sql.Node {
 
 func (ii *InsertInto) Database() sql.Database {
 	return ii.db
+}
+
+func (ii *InsertInto) IsReadOnly() bool {
+	return false
 }
 
 func (ii *InsertInto) WithDatabase(database sql.Database) (sql.Node, error) {
@@ -153,12 +170,21 @@ func (id InsertDestination) WithExpressions(exprs ...sql.Expression) (sql.Node, 
 		return nil, sql.ErrInvalidChildrenNumber.New(id, len(exprs), len(id.Sch))
 	}
 
-	id.Sch = transform.SchemaWithDefaults(id.Sch, exprs)
+	sch, err := transform.SchemaWithDefaults(id.Sch, exprs)
+	if err != nil {
+		return nil, err
+	}
+
+	id.Sch = sch
 	return &id, nil
 }
 
 func (id *InsertDestination) Name() string {
 	return id.DestinationName
+}
+
+func (id *InsertDestination) IsReadOnly() bool {
+	return true
 }
 
 func (id *InsertDestination) String() string {
@@ -294,18 +320,18 @@ func (ii InsertInto) DebugString() string {
 }
 
 func (ii *InsertInto) Expressions() []sql.Expression {
-	return append(ii.OnDupExprs, ii.Checks.ToExpressions()...)
+	return append(ii.OnDupExprs, ii.checks.ToExpressions()...)
 }
 
 func (ii InsertInto) WithExpressions(newExprs ...sql.Expression) (sql.Node, error) {
-	if len(newExprs) != len(ii.OnDupExprs)+len(ii.Checks) {
-		return nil, sql.ErrInvalidChildrenNumber.New(ii, len(newExprs), len(ii.OnDupExprs)+len(ii.Checks))
+	if len(newExprs) != len(ii.OnDupExprs)+len(ii.checks) {
+		return nil, sql.ErrInvalidChildrenNumber.New(ii, len(newExprs), len(ii.OnDupExprs)+len(ii.checks))
 	}
 
 	ii.OnDupExprs = newExprs[:len(ii.OnDupExprs)]
 
 	var err error
-	ii.Checks, err = ii.Checks.FromExpressions(newExprs[len(ii.OnDupExprs):])
+	ii.checks, err = ii.checks.FromExpressions(newExprs[len(ii.OnDupExprs):])
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +349,7 @@ func (ii *InsertInto) Resolved() bool {
 			return false
 		}
 	}
-	for _, checkExpr := range ii.Checks {
+	for _, checkExpr := range ii.checks {
 		if !checkExpr.Expr.Resolved() {
 			return false
 		}

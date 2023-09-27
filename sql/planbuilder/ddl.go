@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -483,19 +497,19 @@ func (b *Builder) buildAlterTableColumnAction(inScope *scope, ddl *ast.DDL, tabl
 		outScope.node = plan.NewAddColumnResolved(table, *sch.Schema[0], columnOrderToColumnOrder(ddl.ColumnOrder))
 	case ast.DropStr:
 		drop := plan.NewDropColumnResolved(table, ddl.Column.String())
-		drop.Checks = b.loadChecksFromTable(outScope, table.Table)
-		outScope.node = drop
+		checks := b.loadChecksFromTable(outScope, table.Table)
+		outScope.node = drop.WithChecks(checks)
 	case ast.RenameStr:
 		rename := plan.NewRenameColumnResolved(table, ddl.Column.String(), ddl.ToColumn.String())
-		rename.Checks = b.loadChecksFromTable(outScope, table.Table)
-		outScope.node = rename
+		checks := b.loadChecksFromTable(outScope, table.Table)
+		outScope.node = rename.WithChecks(checks)
 	case ast.ModifyStr, ast.ChangeStr:
 		// modify adds a new column maybe with same name
 		// make new hierarchy so it resolves before old column
 		outScope = inScope.push()
 		sch, _ := b.tableSpecToSchema(inScope, outScope, table.Database(), ddl.Table.Name.String(), ddl.TableSpec, true)
-
-		outScope.node = plan.NewModifyColumnResolved(table, ddl.Column.String(), *sch.Schema[0], columnOrderToColumnOrder(ddl.ColumnOrder))
+		modifyCol := plan.NewModifyColumnResolved(table, ddl.Column.String(), *sch.Schema[0], columnOrderToColumnOrder(ddl.ColumnOrder))
+		outScope.node = modifyCol
 	default:
 		err := sql.ErrUnsupportedFeature.New(ast.String(ddl))
 		b.handleErr(err)
@@ -699,7 +713,6 @@ func (b *Builder) buildReferentialAction(action ast.ReferenceAction) sql.Foreign
 	}
 }
 
-// todo drop column, rename column
 func (b *Builder) buildAlterIndex(inScope *scope, ddl *ast.DDL, table *plan.ResolvedTable) (outScope *scope) {
 	outScope = inScope
 	switch strings.ToLower(ddl.IndexSpec.Action) {
@@ -748,7 +761,8 @@ func (b *Builder) buildAlterIndex(inScope *scope, ddl *ast.DDL, table *plan.Reso
 			b.handleErr(err)
 		}
 
-		outScope.node = plan.NewAlterCreateIndex(table.SqlDatabase, table, ddl.IndexSpec.ToName.String(), using, constraint, columns, comment)
+		createIndex := plan.NewAlterCreateIndex(table.SqlDatabase, table, ddl.IndexSpec.ToName.String(), using, constraint, columns, comment)
+		outScope.node = b.modifySchemaTarget(inScope, createIndex, table)
 		return
 	case ast.DropStr:
 		if ddl.IndexSpec.Type == ast.PrimaryStr {
@@ -906,7 +920,7 @@ func (b *Builder) buildDefaultExpression(inScope *scope, defaultExpr ast.Expr) *
 // rather than "(5)"), then the parameter "isLiteral" should be true.
 func ExpressionToColumnDefaultValue(inputExpr sql.Expression, isLiteral, isParenthesized bool) *sql.ColumnDefaultValue {
 	return &sql.ColumnDefaultValue{
-		Expression:    inputExpr,
+		Expr:          inputExpr,
 		OutType:       nil,
 		Literal:       isLiteral,
 		ReturnNil:     true,
@@ -993,6 +1007,7 @@ func (b *Builder) tableSpecToSchema(inScope, outScope *scope, db sql.Database, t
 	}
 
 	defaults := make([]ast.Expr, len(tableSpec.Columns))
+	generated := make([]ast.Expr, len(tableSpec.Columns))
 	var schema sql.Schema
 	for i, cd := range tableSpec.Columns {
 		// Use the table's collation if no character or collation was specified for the table
@@ -1002,7 +1017,11 @@ func (b *Builder) tableSpecToSchema(inScope, outScope *scope, db sql.Database, t
 			}
 		}
 		defaults[i] = cd.Type.Default
+		generated[i] = cd.Type.GeneratedExpr
+
 		cd.Type.Default = nil
+		cd.Type.GeneratedExpr = nil
+
 		column := b.columnDefinitionToColumn(inScope, cd, tableSpec.Indexes)
 
 		if column.PrimaryKey && bool(cd.Type.Null) {
@@ -1021,6 +1040,21 @@ func (b *Builder) tableSpecToSchema(inScope, outScope *scope, db sql.Database, t
 
 	for i, def := range defaults {
 		schema[i].Default = b.convertDefaultExpression(outScope, def, schema[i].Type, schema[i].Nullable)
+		if def != nil && generated[i] != nil {
+			b.handleErr(sql.ErrGeneratedColumnWithDefault.New())
+			return sql.PrimaryKeySchema{}, sql.Collation_Unspecified
+		}
+	}
+
+	for i, gen := range generated {
+		if gen != nil {
+			virtual := !bool(tableSpec.Columns[i].Type.Stored)
+			schema[i].Generated = b.convertDefaultExpression(outScope, gen, schema[i].Type, schema[i].Nullable)
+			// generated expressions are always parenthesized, but we don't record this in the parser
+			schema[i].Generated.Parenthesized = true
+			schema[i].Generated.Literal = false
+			schema[i].Virtual = virtual
+		}
 	}
 
 	return sql.NewPrimaryKeySchema(schema, getPkOrdinals(tableSpec)...), tableCollation
@@ -1093,7 +1127,8 @@ func getPkOrdinals(ts *ast.TableSpec) []int {
 	return []int{}
 }
 
-// columnDefinitionToColumn returns the sql.Column for the column definition given, as part of a create table statement.
+// columnDefinitionToColumn returns the sql.Column for the column definition given, as part of a create table
+// statement. Defaults and generated expressions must be handled separately.
 func (b *Builder) columnDefinitionToColumn(inScope *scope, cd *ast.ColumnDefinition, indexes []*ast.IndexDefinition) *sql.Column {
 	internalTyp, err := types.ColumnTypeToType(&cd.Type)
 	if err != nil {
@@ -1124,8 +1159,6 @@ func (b *Builder) columnDefinitionToColumn(inScope *scope, cd *ast.ColumnDefinit
 	}
 
 	nullable := !isPkey && !bool(cd.Type.NotNull)
-	defaultVal := b.convertDefaultExpression(inScope, cd.Type.Default, internalTyp, nullable)
-
 	extra := ""
 
 	if cd.Type.Autoincrement {
@@ -1149,12 +1182,11 @@ func (b *Builder) columnDefinitionToColumn(inScope *scope, cd *ast.ColumnDefinit
 	}
 
 	return &sql.Column{
-		Nullable:      nullable,
-		Type:          internalTyp,
 		Name:          cd.Name.String(),
-		PrimaryKey:    isPkey,
-		Default:       defaultVal,
+		Type:          internalTyp,
 		AutoIncrement: bool(cd.Type.Autoincrement),
+		Nullable:      nullable,
+		PrimaryKey:    isPkey,
 		Comment:       comment,
 		Extra:         extra,
 	}
@@ -1170,36 +1202,51 @@ func (b *Builder) modifySchemaTarget(inScope *scope, n sql.SchemaTarget, rt *pla
 }
 
 func (b *Builder) resolveSchemaDefaults(inScope *scope, schema sql.Schema) sql.Schema {
-	for i, col := range schema {
-		if col.Default == nil || col.Default.Expression == nil {
-			continue
-		}
-		def, ok := col.Default.Expression.(sql.UnresolvedColumnDefault)
-		if ok && def.String() == "" {
-			schema[i].Default = b.convertDefaultExpression(inScope, &ast.SQLVal{Val: []byte{}, Type: ast.StrVal}, schema[i].Type, schema[i].Nullable)
-			continue
-		} else if !ok {
-			continue
-		}
-		parsed, err := ast.Parse(fmt.Sprintf("SELECT %s", def))
-		if err != nil {
-			err := fmt.Errorf("%w: %s", sql.ErrInvalidColumnDefaultValue.New(def), err)
-			b.handleErr(err)
-		}
-		selectStmt, ok := parsed.(*ast.Select)
-		if !ok || len(selectStmt.SelectExprs) != 1 {
-			err := sql.ErrInvalidColumnDefaultValue.New(def)
-			b.handleErr(err)
-		}
-		expr := selectStmt.SelectExprs[0]
-		ae, ok := expr.(*ast.AliasedExpr)
-		if !ok {
-			err := sql.ErrInvalidColumnDefaultValue.New(def)
-			b.handleErr(err)
-		}
-		schema[i].Default = b.convertDefaultExpression(inScope, ae.Expr, schema[i].Type, schema[i].Nullable)
+	newSch := schema.Copy()
+	for _, col := range newSch {
+		col.Default = b.resolveColumnDefaultExpression(inScope, col, col.Default)
+		col.Generated = b.resolveColumnDefaultExpression(inScope, col, col.Generated)
 	}
-	return schema
+	return newSch
+}
+
+func (b *Builder) resolveColumnDefaultExpression(inScope *scope, columnDef *sql.Column, colDefault *sql.ColumnDefaultValue) *sql.ColumnDefaultValue {
+	if colDefault == nil || colDefault.Expr == nil {
+		return colDefault
+	}
+
+	def, ok := colDefault.Expr.(*sql.UnresolvedColumnDefault)
+	if !ok {
+		// no resolution work to be done, return the original value
+		return colDefault
+	}
+
+	// Empty string is a special case, it means the default value is the empty string
+	// TODO: why isn't this serialized as ''
+	if def.String() == "" {
+		return b.convertDefaultExpression(inScope, &ast.SQLVal{Val: []byte{}, Type: ast.StrVal}, columnDef.Type, columnDef.Nullable)
+	}
+
+	parsed, err := ast.Parse(fmt.Sprintf("SELECT %s", def))
+	if err != nil {
+		err := fmt.Errorf("%w: %s", sql.ErrInvalidColumnDefaultValue.New(def), err)
+		b.handleErr(err)
+	}
+
+	selectStmt, ok := parsed.(*ast.Select)
+	if !ok || len(selectStmt.SelectExprs) != 1 {
+		err := sql.ErrInvalidColumnDefaultValue.New(def)
+		b.handleErr(err)
+	}
+
+	expr := selectStmt.SelectExprs[0]
+	ae, ok := expr.(*ast.AliasedExpr)
+	if !ok {
+		err := sql.ErrInvalidColumnDefaultValue.New(def)
+		b.handleErr(err)
+	}
+
+	return b.convertDefaultExpression(inScope, ae.Expr, columnDef.Type, columnDef.Nullable)
 }
 
 func (b *Builder) convertDefaultExpression(inScope *scope, defaultExpr ast.Expr, typ sql.Type, nullable bool) *sql.ColumnDefaultValue {
@@ -1247,7 +1294,7 @@ func (b *Builder) convertDefaultExpression(inScope *scope, defaultExpr ast.Expr,
 	}
 
 	return &sql.ColumnDefaultValue{
-		Expression:    resExpr,
+		Expr:          resExpr,
 		OutType:       typ,
 		Literal:       isLiteral,
 		ReturnNil:     nullable,

@@ -16,6 +16,7 @@ package queries
 
 import (
 	"math"
+	"time"
 
 	"github.com/dolthub/vitess/go/mysql"
 
@@ -828,6 +829,24 @@ var SpatialInsertQueries = []WriteQueryTest{
 
 var InsertScripts = []ScriptTest{
 	{
+		// https://github.com/dolthub/dolt/issues/6675
+		Name: "issue 6675: on duplicate rearranged getfield indexes from select source",
+		SetUpScript: []string{
+			"create table xy (x int primary key, y datetime)",
+			"insert into xy values (0,'2023-09-16')",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "INSERT INTO xy (y,x) select * from (select cast('2019-12-31T12:00:00Z' as date), 0) dt(a,b) ON DUPLICATE KEY UPDATE x=dt.b+1, y=dt.a",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "select * from xy",
+				Expected: []sql.Row{{1, time.Date(2019, time.December, 31, 0, 0, 0, 0, time.UTC)}},
+			},
+		},
+	},
+	{
 		// https://github.com/dolthub/dolt/issues/4857
 		Name: "issue 4857: insert cte column alias with table alias qualify panic",
 		SetUpScript: []string{
@@ -1000,9 +1019,19 @@ var InsertScripts = []ScriptTest{
 			);`,
 			"insert into auto values (NULL,10), (NULL,20), (NULL,30)",
 			"alter table auto auto_increment 9;",
-			"insert into auto values (NULL,90)",
 		},
 		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "SELECT AUTO_INCREMENT FROM information_schema.tables WHERE table_name = 'auto' AND table_schema = DATABASE()",
+				Expected: []sql.Row{{uint64(9)}},
+			},
+			{
+				Query: "insert into auto values (NULL,90)",
+				Expected: []sql.Row{{types.OkResult{
+					RowsAffected: 1,
+					InsertID:     9,
+				}}},
+			},
 			{
 				Query: "select * from auto order by 1",
 				Expected: []sql.Row{
@@ -1893,6 +1922,78 @@ var InsertScripts = []ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "INSERT IGNORE works with FK Violations",
+		SetUpScript: []string{
+			"CREATE TABLE t1 (id INT PRIMARY KEY, v int);",
+			"CREATE TABLE t2 (id INT PRIMARY KEY, v2 int, CONSTRAINT mfk FOREIGN KEY (v2) REFERENCES t1(id));",
+			"INSERT INTO t1 values (1,1)",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query: "INSERT IGNORE INTO t2 VALUES (1,2);",
+				Expected: []sql.Row{
+					{types.OkResult{RowsAffected: 0}},
+				},
+				ExpectedWarning: mysql.ErNoReferencedRow2,
+			},
+		},
+	},
+	{
+		Name: "insert duplicate key doesn't prevent other updates",
+		SetUpScript: []string{
+			"CREATE TABLE t1 (pk BIGINT PRIMARY KEY, v1 VARCHAR(3));",
+			"INSERT INTO t1 VALUES (1, 'abc');",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "select * from t1 order by pk",
+				Expected: []sql.Row{{1, "abc"}},
+			},
+			{
+				Query:       "INSERT INTO t1 VALUES (1, 'abc');",
+				ExpectedErr: sql.ErrPrimaryKeyViolation,
+			},
+			{
+				Query:    "INSERT INTO t1 VALUES (2, 'def');",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "select * from t1 order by pk",
+				Expected: []sql.Row{{1, "abc"}, {2, "def"}},
+			},
+		},
+	},
+	{
+		Name: "insert duplicate key doesn't prevent other updates, autocommit off",
+		SetUpScript: []string{
+			"CREATE TABLE t1 (pk BIGINT PRIMARY KEY, v1 VARCHAR(3));",
+			"INSERT INTO t1 VALUES (1, 'abc');",
+			"SET autocommit = 0;",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "select * from t1 order by pk",
+				Expected: []sql.Row{{1, "abc"}},
+			},
+			{
+				Query:       "INSERT INTO t1 VALUES (1, 'abc');",
+				ExpectedErr: sql.ErrPrimaryKeyViolation,
+			},
+			{
+				Query:    "INSERT INTO t1 VALUES (2, 'def');",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:            "commit",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select * from t1 order by pk",
+				Expected: []sql.Row{{1, "abc"}, {2, "def"}},
+			},
+		},
+	},
 }
 
 var InsertDuplicateKeyKeyless = []ScriptTest{
@@ -2524,24 +2625,6 @@ var IgnoreWithDuplicateUniqueKeyKeylessScripts = []ScriptTest{
 }
 
 var InsertBrokenScripts = []ScriptTest{
-	// TODO: Support unique keys and FK violations in memory implementation
-	{
-		Name: "Test that INSERT IGNORE works with FK Violations",
-		SetUpScript: []string{
-			"CREATE TABLE t1 (id INT PRIMARY KEY, v int);",
-			"CREATE TABLE t2 (id INT PRIMARY KEY, v2 int, CONSTRAINT mfk FOREIGN KEY (v2) REFERENCES t1(id));",
-			"INSERT INTO t1 values (1,1)",
-		},
-		Assertions: []ScriptTestAssertion{
-			{
-				Query: "INSERT IGNORE INTO t2 VALUES (1,2);",
-				Expected: []sql.Row{
-					{types.OkResult{RowsAffected: 0}},
-				},
-				ExpectedWarning: mysql.ErNoReferencedRow2,
-			},
-		},
-	},
 	// TODO: Condense all of our casting logic into a single error.
 	{
 		Name: "Test that INSERT IGNORE assigns the closest dataype correctly",
@@ -2570,6 +2653,18 @@ var InsertBrokenScripts = []ScriptTest{
 					{types.OkResult{RowsAffected: 1}},
 				},
 				ExpectedWarning: mysql.ERTruncatedWrongValueForField,
+			},
+		},
+	},
+	{
+		Name: "Test explicit default with column reference",
+		SetUpScript: []string{
+			"CREATE TABLE t1 (a int default 1, b int default (a+1));",
+		},
+		Assertions: []ScriptTestAssertion{
+			{
+				Query:    "INSERT INTO t1 (a,b) values (1, DEFAULT)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1}}},
 			},
 		},
 	},

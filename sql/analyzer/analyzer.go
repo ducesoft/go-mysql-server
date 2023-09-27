@@ -26,7 +26,6 @@ import (
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/memo"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/rowexec"
@@ -34,6 +33,7 @@ import (
 )
 
 const debugAnalyzerKey = "DEBUG_ANALYZER"
+const verboseAnalyzerKey = "VERBOSE_ANALYZER"
 
 const maxAnalysisIterations = 8
 
@@ -81,11 +81,11 @@ type Builder struct {
 func NewBuilder(pro sql.DatabaseProvider) *Builder {
 	return &Builder{
 		provider:        pro,
-		onceBeforeRules: OnceBeforeDefault_Exp,
-		defaultRules:    DefaultRules_Exp,
-		onceAfterRules:  OnceAfterDefault_Experimental,
+		onceBeforeRules: OnceBeforeDefault,
+		defaultRules:    DefaultRules,
+		onceAfterRules:  OnceAfterDefault,
 		validationRules: DefaultValidationRules,
-		afterAllRules:   OnceAfterAll_Experimental,
+		afterAllRules:   OnceAfterAll,
 	}
 }
 
@@ -212,6 +212,7 @@ func (s simpleLogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 // Build creates a new Analyzer from the builder parameters
 func (ab *Builder) Build() *Analyzer {
 	_, debug := os.LookupEnv(debugAnalyzerKey)
+	_, verbose := os.LookupEnv(verboseAnalyzerKey)
 	var batches = []*Batch{
 		{
 			Desc:       "pre-analyzer",
@@ -262,6 +263,7 @@ func (ab *Builder) Build() *Analyzer {
 
 	return &Analyzer{
 		Debug:        debug || ab.debug,
+		Verbose:      verbose,
 		contextStack: make([]string, 0),
 		Batches:      batches,
 		Catalog:      NewCatalog(ab.provider),
@@ -286,15 +288,15 @@ type Analyzer struct {
 	Batches []*Batch
 	// Catalog of databases and registered functions.
 	Catalog *Catalog
-	// BinlogReplicaController holds an optional controller that receives forwarded binlog
-	// replication messages (e.g. "start replica").
-	BinlogReplicaController binlogreplication.BinlogReplicaController
 	// Carder estimates the number of rows returned by a relational expression.
 	Carder memo.Carder
 	// Coster estimates the incremental CPU+memory cost for execution operators.
 	Coster memo.Coster
 	// ExecBuilder converts a sql.Node tree into an executable iterator.
 	ExecBuilder sql.NodeExecBuilder
+	// EventScheduler is used to communiate with the event scheduler
+	// for any EVENT related statements. It can be nil if EventScheduler is not defined.
+	EventScheduler sql.EventScheduler
 }
 
 // NewDefault creates a default Analyzer instance with all default Rules and configuration.
@@ -403,8 +405,7 @@ func DefaultRuleSelector(id RuleId) bool {
 func NewProcRuleSelector(sel RuleSelector) RuleSelector {
 	return func(id RuleId) bool {
 		switch id {
-		case optimizeJoinsId,
-			pruneTablesId,
+		case pruneTablesId,
 			transformJoinApplyId,
 
 			// once after default rules should only be run once
@@ -426,7 +427,8 @@ func NewResolveSubqueryExprSelector(sel RuleSelector) RuleSelector {
 			hoistOutOfScopeFiltersId,
 			hoistSelectExistsId,
 			transformJoinApplyId,
-			finalizeSubqueriesId:
+			finalizeSubqueriesId,
+			assignExecIndexesId:
 			return false
 		}
 		return sel(id)
@@ -445,7 +447,8 @@ func NewFinalizeSubquerySel(sel RuleSelector) RuleSelector {
 			finalizeSubqueriesId,
 			hoistOutOfScopeFiltersId,
 			cacheSubqueryResultsId,
-			TrackProcessId:
+			TrackProcessId,
+			assignExecIndexesId:
 			return false
 		}
 		return sel(id)
@@ -473,7 +476,8 @@ func NewFinalizeUnionSel(sel RuleSelector) RuleSelector {
 func newInsertSourceSelector(sel RuleSelector) RuleSelector {
 	return func(id RuleId) bool {
 		switch id {
-		case transformJoinApplyId:
+		case transformJoinApplyId,
+			pushdownSubqueryAliasFiltersId:
 			return false
 		}
 		return sel(id)
@@ -485,125 +489,6 @@ func newInsertSourceSelector(sel RuleSelector) RuleSelector {
 func (a *Analyzer) Analyze(ctx *sql.Context, n sql.Node, scope *plan.Scope) (sql.Node, error) {
 	n, _, err := a.analyzeWithSelector(ctx, n, scope, SelectAllBatches, DefaultRuleSelector)
 	return n, err
-}
-
-// prePrepareRuleSelector are applied before a prepared statement before bindvars
-// are applied
-func prePrepareRuleSelector(id RuleId) bool {
-	switch id {
-	case
-		// OnceBeforeDefault
-		reresolveTablesId,
-		validatePrivilegesId,
-
-		// Default
-
-		// OnceAfterDefault
-		insertTopNId,
-		resolvePreparedInsertId,
-
-		// DefaultValidation
-		validateResolvedId,
-		validateGroupById,
-		validateUnionSchemasMatchId,
-		validateOperandsId,
-
-		// OnceAfterAll
-		TrackProcessId,
-		parallelizeId:
-		return false
-	default:
-		return true
-	}
-}
-
-// PrepareQuery applies a partial set of transformations to a prepared plan.
-func (a *Analyzer) PrepareQuery(ctx *sql.Context, n sql.Node, scope *plan.Scope) (sql.Node, error) {
-	n, _, err := a.analyzeWithSelector(ctx, n, scope, SelectAllBatches, prePrepareRuleSelector)
-	return n, err
-}
-
-// postPrepareRuleSelector are applied to a cached prepared statement plan
-// after bindvars are applied
-func postPrepareRuleSelector(id RuleId) bool {
-	switch id {
-	case
-		// OnceBeforeDefault
-		resolveDatabasesId,
-		resolveTablesId,
-		reresolveTablesId,
-		setTargetSchemasId,
-		parseColumnDefaultsId,
-		assignCatalogId,
-		resolveColumnDefaultsId,
-		resolveTableFunctionsId,
-		validatePrivilegesId,
-
-		// DefaultRules
-		resolveOrderbyLiteralsId,
-		resolveFunctionsId,
-		flattenTableAliasesId,
-		pushdownSortId,
-		pushdownGroupbyAliasesId,
-		qualifyColumnsId,
-		resolveColumnsId,
-		expandStarsId,
-		flattenAggregationExprsId,
-
-		// OnceAfterDefault
-		generateIndexScansId,
-		subqueryIndexesId,
-		stripTableNameInDefaultsId,
-		resolvePreparedInsertId,
-		finalizeSubqueriesId,
-
-		// DefaultValidationRules
-		validateResolvedId,
-		validateGroupById,
-		validateOperandsId,
-		//validateUnionSchemasMatchId, // TODO: we never validate UnionSchemasMatchId :)
-
-		// OnceAfterAll
-		parallelizeId,
-		TrackProcessId:
-		return true
-	}
-	return false
-}
-
-// prePrepareRuleSelector are applied to a cached prepared statement plan
-// after bindvars are applied
-func postPrepareInsertSourceRuleSelector(id RuleId) bool {
-	switch id {
-	case reresolveTablesId,
-		expandStarsId,
-		resolveFunctionsId,
-		flattenTableAliasesId,
-		pushdownSortId,
-		pushdownGroupbyAliasesId,
-		resolveDatabasesId,
-		resolveTablesId,
-
-		resolveOrderbyLiteralsId,
-		qualifyColumnsId,
-		resolveColumnsId,
-
-		generateIndexScansId,
-		subqueryIndexesId,
-		resolveInsertRowsId,
-
-		AutocommitId,
-		TrackProcessId,
-		parallelizeId,
-		clearWarningsId:
-		return true
-	}
-	return false
-}
-
-// AnalyzePrepared runs a partial rule set against a previously analyzed plan.
-func (a *Analyzer) AnalyzePrepared(ctx *sql.Context, n sql.Node, scope *plan.Scope) (sql.Node, transform.TreeIdentity, error) {
-	return a.analyzeWithSelector(ctx, n, scope, SelectAllBatches, postPrepareRuleSelector)
 }
 
 func (a *Analyzer) analyzeThroughBatch(ctx *sql.Context, n sql.Node, scope *plan.Scope, until string, sel RuleSelector) (sql.Node, transform.TreeIdentity, error) {

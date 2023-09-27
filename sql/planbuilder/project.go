@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -32,17 +46,20 @@ func (b *Builder) analyzeSelectList(inScope, outScope *scope, selectExprs ast.Se
 
 		// TODO two passes for symbol res and semantic validation
 		var aRef string
+		var subqueryFound bool
 		inScopeAliasRef := transform.InspectExpr(pe, func(e sql.Expression) bool {
 			var id columnId
 			switch e := e.(type) {
 			case *expression.GetField:
 				if e.Table() == "" {
-					id = columnId(e.Index())
+					id = columnId(e.Id())
 					aRef = e.Name()
 				}
 			case *expression.Alias:
 				id = columnId(e.Id())
 				aRef = e.Name()
+			case *plan.Subquery:
+				subqueryFound = true
 			}
 			if aRef != "" {
 				collisionId, ok := tempScope.exprs[strings.ToLower(aRef)]
@@ -53,6 +70,10 @@ func (b *Builder) analyzeSelectList(inScope, outScope *scope, selectExprs ast.Se
 		if inScopeAliasRef {
 			err := sql.ErrMisusedAlias.New(aRef)
 			b.handleErr(err)
+		}
+		if subqueryFound {
+			outScope.refsSubquery = true
+
 		}
 
 		switch e := pe.(type) {
@@ -167,7 +188,7 @@ func (b *Builder) buildProjection(inScope, outScope *scope) {
 	for i, sc := range outScope.cols {
 		projections[i] = sc.scalar
 	}
-	proj, err := factoryBuildProject(plan.NewProject(projections, inScope.node))
+	proj, err := b.f.buildProject(plan.NewProject(projections, inScope.node), outScope.refsSubquery)
 	if err != nil {
 		b.handleErr(err)
 	}

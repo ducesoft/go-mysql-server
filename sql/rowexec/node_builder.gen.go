@@ -107,8 +107,8 @@ func (b *BaseBuilder) buildNodeExec(ctx *sql.Context, n sql.Node, row sql.Row) (
 		return b.buildSort(ctx, n, row)
 	case *plan.SubqueryAlias:
 		return b.buildSubqueryAlias(ctx, n, row)
-	case *plan.Union:
-		return b.buildUnion(ctx, n, row)
+	case *plan.SetOp:
+		return b.buildSetOp(ctx, n, row)
 	case *plan.IndexedTableAccess:
 		return b.buildIndexedTableAccess(ctx, n, row)
 	case *plan.TableAlias:
@@ -255,6 +255,8 @@ func (b *BaseBuilder) buildNodeExec(ctx *sql.Context, n sql.Node, row sql.Row) (
 		return b.buildShowStatus(ctx, n, row)
 	case *plan.ShowTableStatus:
 		return b.buildShowTableStatus(ctx, n, row)
+	case *plan.ShowCreateEvent:
+		return b.buildShowCreateEvent(ctx, n, row)
 	case *plan.SignalName:
 		return b.buildSignalName(ctx, n, row)
 	case *plan.StartTransaction:

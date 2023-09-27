@@ -38,6 +38,10 @@ func (c *CreateDB) Resolved() bool {
 	return true
 }
 
+func (c *CreateDB) IsReadOnly() bool {
+	return false
+}
+
 func (c *CreateDB) String() string {
 	ifNotExists := ""
 	if c.IfNotExists {
@@ -87,13 +91,21 @@ type DropDB struct {
 	Catalog  sql.Catalog
 	DbName   string
 	IfExists bool
+	// EventScheduler is used to notify EventSchedulerStatus of database deletion,
+	// so the events of this database in the scheduler will be removed.
+	EventScheduler sql.EventScheduler
 }
 
 var _ sql.Node = (*DropDB)(nil)
 var _ sql.CollationCoercible = (*DropDB)(nil)
+var _ sql.EventSchedulerStatement = (*DropDB)(nil)
 
 func (d *DropDB) Resolved() bool {
 	return true
+}
+
+func (d *DropDB) IsReadOnly() bool {
+	return false
 }
 
 func (d *DropDB) String() string {
@@ -114,6 +126,13 @@ func (d *DropDB) Children() []sql.Node {
 
 func (d *DropDB) WithChildren(children ...sql.Node) (sql.Node, error) {
 	return NillaryWithChildren(d, children...)
+}
+
+// WithEventScheduler is used to drop all events from EventSchedulerStatus for DROP DATABASE.
+func (d *DropDB) WithEventScheduler(scheduler sql.EventScheduler) sql.Node {
+	na := *d
+	na.EventScheduler = scheduler
+	return &na
 }
 
 // CheckPrivileges implements the interface sql.Node.
@@ -147,6 +166,10 @@ var _ sql.CollationCoercible = (*AlterDB)(nil)
 // Resolved implements the interface sql.Node.
 func (c *AlterDB) Resolved() bool {
 	return true
+}
+
+func (c *AlterDB) IsReadOnly() bool {
+	return false
 }
 
 // String implements the interface sql.Node.

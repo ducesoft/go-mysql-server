@@ -83,7 +83,9 @@ func (f *FulltextFilterTable) PartitionRows(ctx *sql.Context, partition sql.Part
 	}
 	wordsStr, ok := words.(string)
 	if !ok {
-		return nil, fmt.Errorf("expected WORD to be a string, but had type `%T`", words)
+		if words != nil {
+			return nil, fmt.Errorf("expected WORD to be a string, but had type `%T`", words)
+		}
 	}
 	collation := fulltext.GetCollationFromSchema(ctx, f.MatchAgainst.DocCountTable.Schema())
 	parser, err := fulltext.NewDefaultParser(ctx, collation, wordsStr)
@@ -205,6 +207,10 @@ func (f *fulltextFilterTableRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 				}}, Index: f.docCountIndex}
 
 				docCountData := f.matchAgainst.DocCountTable.IndexedAccess(lookup)
+				if err != nil {
+					return nil, err
+				}
+
 				partIter, err := docCountData.LookupPartitions(ctx, lookup)
 				if err != nil {
 					return nil, err
@@ -234,6 +240,10 @@ func (f *fulltextFilterTableRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			lookup := sql.IndexLookup{Ranges: []sql.Range{ranges}, Index: f.parentIndex}
 
 			parentData := f.matchAgainst.ParentTable.IndexedAccess(lookup)
+			if err != nil {
+				return nil, err
+			}
+
 			partIter, err := parentData.LookupPartitions(ctx, lookup)
 			if err != nil {
 				return nil, err

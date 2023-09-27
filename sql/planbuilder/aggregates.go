@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -90,14 +104,25 @@ func (b *Builder) buildGroupingCols(fromScope, projScope *scope, groupby ast.Gro
 		switch e := e.(type) {
 		case *ast.ColName:
 			var ok bool
-			col, ok = projScope.resolveColumn(strings.ToLower(e.Qualifier.Name.String()), strings.ToLower(e.Name.String()), true)
+			// GROUP BY binds to column references before projections.
+			col, ok = fromScope.resolveColumn(strings.ToLower(e.Qualifier.Name.String()), strings.ToLower(e.Name.String()), true)
+			if !ok {
+				col, ok = projScope.resolveColumn(strings.ToLower(e.Qualifier.Name.String()), strings.ToLower(e.Name.String()), true)
+			}
+
 			if !ok {
 				b.handleErr(sql.ErrColumnNotFound.New(e.Name.String()))
 			}
 		case *ast.SQLVal:
 			// literal -> index into targets
-			if e.Type == ast.IntVal {
-				lit := b.convertInt(string(e.Val), 10)
+			replace := b.normalizeValArg(e)
+			val, ok := replace.(*ast.SQLVal)
+			if !ok {
+				// ast.NullVal
+				continue
+			}
+			if val.Type == ast.IntVal {
+				lit := b.convertInt(string(val.Val), 10)
 				idx, _, err := types.Int64.Convert(lit.Value())
 				if err != nil {
 					b.handleErr(err)
@@ -177,7 +202,7 @@ func (b *Builder) buildAggregation(fromScope, projScope *scope, groupingCols []s
 		transform.InspectExpr(col.scalar, func(e sql.Expression) bool {
 			switch e := e.(type) {
 			case *expression.GetField:
-				colName := strings.ToLower(e.Name())
+				colName := strings.ToLower(e.String())
 				if !selectStr[colName] {
 					selectExprs = append(selectExprs, e)
 					selectGfs = append(selectGfs, e)
@@ -190,11 +215,11 @@ func (b *Builder) buildAggregation(fromScope, projScope *scope, groupingCols []s
 	}
 	for _, e := range fromScope.extraCols {
 		// accessory cols used by ORDER_BY, HAVING
-		if !selectStr[e.col] {
+		if !selectStr[e.String()] {
 			selectExprs = append(selectExprs, e.scalarGf())
 			selectGfs = append(selectGfs, e.scalarGf())
 
-			selectStr[e.col] = true
+			selectStr[e.String()] = true
 		}
 	}
 	gb := plan.NewGroupBy(selectExprs, groupingCols, fromScope.node)
@@ -289,6 +314,10 @@ func (b *Builder) buildAggregateFunc(inScope *scope, name string, e *ast.FuncExp
 		case *expression.Star:
 			err := sql.ErrStarUnsupported.New()
 			b.handleErr(err)
+		case *plan.Subquery:
+			args = append(args, e)
+			col := scopeColumn{col: e.QueryString, scalar: e, typ: e.Type()}
+			gb.addInCol(col)
 		default:
 			args = append(args, e)
 			col := scopeColumn{col: e.String(), scalar: e, typ: e.Type()}
@@ -328,14 +357,14 @@ func (b *Builder) buildAggregateFunc(inScope *scope, name string, e *ast.FuncExp
 		aggType = types.Float64
 	}
 
-	aggName := strings.ToLower(agg.String())
+	aggName := strings.ToLower(plan.AliasSubqueryString(agg))
 	if id, ok := gb.outScope.getExpr(aggName, true); ok {
 		// if we've already computed use reference here
-		gf := expression.NewGetFieldWithTable(int(id), aggType, "", agg.String(), agg.IsNullable())
+		gf := expression.NewGetFieldWithTable(int(id), aggType, "", aggName, agg.IsNullable())
 		return gf
 	}
 
-	col := scopeColumn{col: strings.ToLower(agg.String()), scalar: agg, typ: aggType, nullable: agg.IsNullable()}
+	col := scopeColumn{col: aggName, scalar: agg, typ: aggType, nullable: agg.IsNullable()}
 	id := gb.outScope.newColumn(col)
 	col.id = id
 	gb.addAggStr(col)
@@ -385,7 +414,8 @@ func (b *Builder) buildGroupConcat(inScope *scope, e *ast.GroupConcatExpr) sql.E
 
 	// todo store ref to aggregate
 	agg := aggregation.NewGroupConcat(e.Distinct, sortFields, separatorS, args, int(groupConcatMaxLen))
-	col := scopeColumn{col: strings.ToLower(agg.String()), scalar: agg, typ: agg.Type(), nullable: agg.IsNullable()}
+	aggName := strings.ToLower(plan.AliasSubqueryString(agg))
+	col := scopeColumn{col: aggName, scalar: agg, typ: agg.Type(), nullable: agg.IsNullable()}
 
 	id := gb.outScope.newColumn(col)
 	gb.addAggStr(col)
@@ -487,11 +517,11 @@ func (b *Builder) buildWindow(fromScope, projScope *scope) *scope {
 		transform.InspectExpr(col.scalar, func(e sql.Expression) bool {
 			switch e := e.(type) {
 			case *expression.GetField:
-				colName := strings.ToLower(e.Name())
+				colName := strings.ToLower(e.String())
 				if !selectStr[colName] {
 					selectExprs = append(selectExprs, e)
-					selectStr[colName] = true
 					selectGfs = append(selectGfs, e)
+					selectStr[colName] = true
 				}
 			default:
 			}
@@ -500,10 +530,10 @@ func (b *Builder) buildWindow(fromScope, projScope *scope) *scope {
 	}
 	for _, e := range fromScope.extraCols {
 		// accessory cols used by ORDER_BY, HAVING
-		if !selectStr[e.col] {
+		if !selectStr[e.String()] {
 			selectExprs = append(selectExprs, e.scalarGf())
 			selectGfs = append(selectGfs, e.scalarGf())
-			selectStr[e.col] = true
+			selectStr[e.String()] = true
 		}
 	}
 
@@ -689,10 +719,8 @@ func (b *Builder) analyzeHaving(fromScope, projScope *scope, having *ast.Where) 
 			}
 			c, ok = fromScope.resolveColumn(strings.ToLower(n.Qualifier.String()), strings.ToLower(n.Name.String()), true)
 			if !ok {
-				if !ok {
-					err := sql.ErrColumnNotFound.New(n.Name)
-					b.handleErr(err)
-				}
+				err := sql.ErrColumnNotFound.New(n.Name)
+				b.handleErr(err)
 			}
 			c.scalar = expression.NewGetFieldWithTable(int(c.id), c.typ, c.table, c.col, c.nullable)
 			fromScope.addExtraColumn(c)

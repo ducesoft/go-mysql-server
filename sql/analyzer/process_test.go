@@ -15,94 +15,47 @@
 package analyzer
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/plan"
-	"github.com/dolthub/go-mysql-server/sql/transform"
-	"github.com/dolthub/go-mysql-server/sql/types"
 )
-
-// TestPreparedStatementQueryTracking asserts that there is no process tracking done when preparing a statement, and
-// that when a prepared statement is analyzed, it correctly gets a QueryProcess node added so that its process is tracked.
-func TestPreparedStatementQueryTracking(t *testing.T) {
-	ctx := sql.NewContext(context.Background())
-
-	commits := memory.NewTable("commits", sql.NewPrimaryKeySchema(sql.Schema{
-		{Name: "repository_id", Source: "commits", Type: types.Text},
-		{Name: "commit_hash", Source: "commits", Type: types.Text},
-		{Name: "commit_author_when", Source: "commits", Type: types.Text},
-	}), nil)
-
-	db := memory.NewDatabase("mydb")
-
-	node := plan.NewProject(
-		[]sql.Expression{
-			expression.NewGetFieldWithTable(0, types.Text, "commits", "repository_id", true),
-			expression.NewGetFieldWithTable(1, types.Text, "commits", "commit_hash", true),
-			expression.NewGetFieldWithTable(2, types.Text, "commits", "commit_author_when", true),
-		}, plan.NewResolvedTable(commits, db, nil))
-
-	db.AddTable("commits", commits)
-	ctx.SetCurrentDatabase("mydb")
-
-	provider := sql.NewDatabaseProvider(db)
-	a := NewDefault(provider)
-
-	prepared, err := a.PrepareQuery(ctx, node, nil)
-	require.NoError(t, err)
-
-	// Preparing a query should NOT apply process tracking
-	_, isQueryProcess := prepared.(*plan.QueryProcess)
-	require.False(t, isQueryProcess)
-
-	// Analyzing a prepared query SHOULD apply process tracking
-	analyzed, identity, err := a.AnalyzePrepared(ctx, prepared, nil)
-	require.NoError(t, err)
-	require.Equal(t, transform.NewTree, identity)
-	_, isQueryProcess = analyzed.(*plan.QueryProcess)
-	require.True(t, isQueryProcess)
-}
 
 func TestTrackProcessSubquery(t *testing.T) {
 	require := require.New(t)
-	rule := getRuleFrom(OnceAfterAll_Experimental, TrackProcessId)
+	rule := getRuleFrom(OnceAfterAll, TrackProcessId)
 	a := NewDefault(sql.NewDatabaseProvider())
+
+	db := memory.NewDatabase("db")
+	pro := memory.NewDBProvider(db)
+	ctx := newContext(pro)
 
 	node := plan.NewProject(
 		nil,
 		plan.NewSubqueryAlias("f", "",
 			plan.NewQueryProcess(
-				plan.NewResolvedTable(memory.NewTable("foo", sql.PrimaryKeySchema{}, nil), nil, nil),
+				plan.NewResolvedTable(memory.NewTable(db, "foo", sql.PrimaryKeySchema{}, nil), nil, nil),
 				nil,
 			),
 		),
 	)
 
-	result, _, err := rule.Apply(sql.NewEmptyContext(), a, node, nil, DefaultRuleSelector)
+	result, _, err := rule.Apply(ctx, a, node, nil, DefaultRuleSelector)
 	require.NoError(err)
 
 	expectedChild := plan.NewProject(
 		nil,
 		plan.NewSubqueryAlias("f", "",
-			plan.NewResolvedTable(memory.NewTable("foo", sql.PrimaryKeySchema{}, nil), nil, nil),
+			plan.NewResolvedTable(memory.NewTable(db, "foo", sql.PrimaryKeySchema{}, nil), nil, nil),
 		),
 	)
 
 	proc, ok := result.(*plan.QueryProcess)
 	require.True(ok)
 	require.Equal(expectedChild, proc.Child())
-}
-
-func withoutProcessTracking(a *Analyzer) *Analyzer {
-	afterAll := a.Batches[len(a.Batches)-1]
-	afterAll.Rules = afterAll.Rules[2:]
-	return a
 }
 
 // wrapper around sql.Table to make it not indexable

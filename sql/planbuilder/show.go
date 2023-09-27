@@ -1,3 +1,17 @@
+// Copyright 2023 Dolthub, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package planbuilder
 
 import (
@@ -9,6 +23,7 @@ import (
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/transform"
@@ -19,6 +34,7 @@ func (b *Builder) buildShow(inScope *scope, s *ast.Show, query string) (outScope
 	showType := strings.ToLower(s.Type)
 	switch showType {
 	case "processlist":
+		outScope = inScope.push()
 		outScope.node = plan.NewShowProcessList()
 	case ast.CreateTableStr, "create view":
 		return b.buildShowTable(inScope, s, showType)
@@ -62,7 +78,11 @@ func (b *Builder) buildShow(inScope *scope, s *ast.Show, query string) (outScope
 		return b.buildShowStatus(inScope, s)
 	case "replica status":
 		outScope = inScope.push()
-		outScope.node = plan.NewShowReplicaStatus()
+		showRep := plan.NewShowReplicaStatus()
+		if binCat, ok := b.cat.(binlogreplication.BinlogReplicaCatalog); ok && binCat.IsBinlogReplicaCatalog() {
+			showRep.ReplicaController = binCat.GetBinlogReplicaController()
+		}
+		outScope.node = showRep
 	default:
 		unsupportedShow := fmt.Sprintf("SHOW %s", s.Type)
 		b.handleErr(sql.ErrUnsupportedFeature.New(unsupportedShow))
@@ -106,6 +126,7 @@ func (b *Builder) buildShowTable(inScope *scope, s *ast.Show, showType string) (
 
 	showCreate := plan.NewShowCreateTableWithAsOf(tableScope.node, showType == "create view", asOfExpr)
 	outScope.node = showCreate
+
 	if rt != nil {
 		checks := b.loadChecksFromTable(outScope, rt.Table)
 		// To match MySQL output format, transform the column names and wrap with backticks
@@ -117,13 +138,16 @@ func (b *Builder) buildShowTable(inScope *scope, s *ast.Show, showType string) (
 				return e, transform.SameTree, nil
 			})
 		}
-		showCreate.Checks = checks
+		showCreate = showCreate.WithChecks(checks).(*plan.ShowCreateTable)
+
+		showCreate.Indexes = b.getInfoSchemaIndexes(rt)
 
 		pks, _ := rt.Table.(sql.PrimaryKeyTable)
 		if pks != nil {
 			showCreate.PrimaryKeySchema = pks.PrimaryKeySchema()
 		}
 		outScope.node = b.modifySchemaTarget(outScope, showCreate, rt)
+
 	}
 	return
 }
@@ -208,7 +232,26 @@ func (b *Builder) buildShowEvent(inScope *scope, s *ast.Show) (outScope *scope) 
 	if dbName == "" {
 		dbName = b.ctx.GetCurrentDatabase()
 	}
-	outScope.node = plan.NewShowCreateEvent(b.resolveDb(dbName), s.Table.Name.String())
+
+	db := b.resolveDb(dbName)
+
+	eventName := strings.ToLower(s.Table.Name.String())
+	eventDb, ok := db.(sql.EventDatabase)
+	if !ok {
+		err := sql.ErrEventsNotSupported.New(db.Name())
+		b.handleErr(err)
+	}
+
+	event, exists, err := eventDb.GetEvent(b.ctx, eventName)
+	if err != nil {
+		b.handleErr(err)
+	}
+	if !exists {
+		err := sql.ErrUnknownEvent.New(eventName)
+		b.handleErr(err)
+	}
+
+	outScope.node = plan.NewShowCreateEvent(db, event)
 	return
 }
 
@@ -220,7 +263,10 @@ func (b *Builder) buildShowAllEvents(inScope *scope, s *ast.Show) (outScope *sco
 		dbName = b.ctx.GetCurrentDatabase()
 	}
 	db := b.resolveDb(dbName)
-	var node sql.Node = plan.NewShowEvents(db)
+	showEvents := plan.NewShowEvents(db)
+	showEvents.Events = b.loadAllEventDefinitions(db)
+
+	var node sql.Node = showEvents
 	for _, c := range node.Schema() {
 		outScope.newColumn(scopeColumn{table: c.Source, col: c.Name, typ: c.Type, nullable: c.Nullable})
 	}
@@ -245,6 +291,17 @@ func (b *Builder) buildShowAllEvents(inScope *scope, s *ast.Show) (outScope *sco
 
 	outScope.node = node
 	return
+}
+
+func (b *Builder) loadAllEventDefinitions(db sql.Database) []sql.EventDefinition {
+	if eventDb, ok := db.(sql.EventDatabase); ok {
+		events, _, err := eventDb.GetEvents(b.ctx)
+		if err != nil {
+			b.handleErr(err)
+		}
+		return events
+	}
+	return nil
 }
 
 func (b *Builder) buildShowProcedure(inScope *scope, s *ast.Show) (outScope *scope) {
@@ -377,14 +434,65 @@ func (b *Builder) buildShowTableStatus(inScope *scope, s *ast.Show) (outScope *s
 
 func (b *Builder) buildShowIndex(inScope *scope, s *ast.Show) (outScope *scope) {
 	outScope = inScope.push()
-	dbName := s.Table.Qualifier.String()
+	dbName := strings.ToLower(s.Database)
+	if dbName == "" {
+		dbName = s.Table.Qualifier.String()
+	}
 	if dbName == "" {
 		dbName = b.ctx.GetCurrentDatabase()
 	}
 	tableName := strings.ToLower(s.Table.Name.String())
-	table := b.resolveTable(tableName, strings.ToLower(dbName), nil)
-	outScope.node = plan.NewShowIndexes(table)
+	tableScope, ok := b.buildTablescan(inScope, strings.ToLower(dbName), tableName, nil)
+	if !ok {
+		err := sql.ErrTableNotFound.New(tableName)
+		b.handleErr(err)
+	}
+	showIdx := plan.NewShowIndexes(tableScope.node)
+	switch n := tableScope.node.(type) {
+	case *plan.ResolvedTable:
+		showIdx.IndexesToShow = b.getInfoSchemaIndexes(n)
+	case *plan.SubqueryAlias:
+		// views don't have keys
+		showIdx.Child = plan.NewResolvedDualTable()
+	default:
+		err := sql.ErrTableNotFound.New(tableName)
+		b.handleErr(err)
+	}
+	outScope.node = showIdx
 	return
+}
+
+func (b *Builder) getInfoSchemaIndexes(rt *plan.ResolvedTable) []sql.Index {
+	it, ok := rt.Table.(sql.IndexAddressableTable)
+	if !ok {
+		return nil
+	}
+
+	indexes, err := it.GetIndexes(b.ctx)
+	if err != nil {
+		b.handleErr(err)
+	}
+
+	for i := 0; i < len(indexes); i++ {
+		// remove generated indexes
+		idx := indexes[i]
+		if idx.IsGenerated() {
+			indexes[i], indexes[len(indexes)-1] = indexes[len(indexes)-1], indexes[i]
+			indexes = indexes[:len(indexes)-1]
+			i--
+		}
+	}
+
+	if b.ctx.GetIndexRegistry().HasIndexes() {
+		idxRegistry := b.ctx.GetIndexRegistry()
+		for _, idx := range idxRegistry.IndexesByTable(rt.Database().Name(), rt.Table.Name()) {
+			if !idx.IsGenerated() {
+				indexes = append(indexes, idx)
+			}
+		}
+	}
+
+	return indexes
 }
 
 func (b *Builder) buildShowVariables(inScope *scope, s *ast.Show) (outScope *scope) {
@@ -449,7 +557,16 @@ func (b *Builder) buildAsOfLit(inScope *scope, t ast.Expr) interface{} {
 func (b *Builder) buildAsOfExpr(inScope *scope, time ast.Expr) sql.Expression {
 	switch v := time.(type) {
 	case *ast.SQLVal:
-		ret, _, err := types.Text.Convert(v.Val)
+		if v.Type == ast.ValArg && (b.bindCtx == nil || b.bindCtx.resolveOnly) {
+			return nil
+		}
+		repl := b.normalizeValArg(v)
+		val, ok := repl.(*ast.SQLVal)
+		if !ok {
+			// *ast.NullVal
+			return nil
+		}
+		ret, _, err := types.Text.Convert(val.Val)
 		if err != nil {
 			b.handleErr(err)
 		}
@@ -579,8 +696,17 @@ func (b *Builder) buildShowAllColumns(inScope *scope, s *ast.Show) (outScope *sc
 	}
 
 	var node sql.Node = show
-	if rt, _ := table.(*plan.ResolvedTable); rt != nil {
-		node = b.modifySchemaTarget(tableScope, show, rt)
+	switch t := table.(type) {
+	case *plan.ResolvedTable:
+		show.Indexes = b.getInfoSchemaIndexes(t)
+		node = b.modifySchemaTarget(tableScope, show, t)
+	case *plan.SubqueryAlias:
+		var err error
+		node, err = show.WithTargetSchema(t.Schema())
+		if err != nil {
+			b.handleErr(err)
+		}
+	default:
 	}
 
 	if s.ShowTablesOpt != nil && s.ShowTablesOpt.Filter != nil {
@@ -721,7 +847,10 @@ func (b *Builder) buildShowStatus(inScope *scope, s *ast.Show) (outScope *scope)
 func (b *Builder) buildShowCharset(inScope *scope, s *ast.Show) (outScope *scope) {
 	outScope = inScope.push()
 
-	var node sql.Node = plan.NewShowCharset()
+	showCharset := plan.NewShowCharset()
+	showCharset.CharacterSetTable = b.resolveTable("character_sets", "information_schema", nil)
+
+	var node sql.Node = showCharset
 	for _, c := range node.Schema() {
 		outScope.newColumn(scopeColumn{table: c.Source, col: c.Name, typ: c.Type, nullable: c.Nullable})
 	}

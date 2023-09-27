@@ -53,7 +53,7 @@ func loadStoredProcedures(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan
 			for _, procedure := range procedures {
 				var procToRegister *plan.Procedure
 				var parsedProcedure sql.Node
-				b, _ := planbuilder.New(ctx, a.Catalog)
+				b := planbuilder.New(ctx, a.Catalog)
 				b.SetParserOptions(sql.NewSqlModeFromString(procedure.SqlMode).ParserOptions())
 				parsedProcedure, _, _, err = b.Parse(procedure.CreateStatement, false)
 				if err != nil {
@@ -87,11 +87,7 @@ func analyzeCreateProcedure(ctx *sql.Context, a *Analyzer, cp *plan.CreateProced
 		return nil, err
 	}
 	var analyzedNode sql.Node
-	analyzedNode, _, err = resolveDeclarations(ctx, a, cp.Procedure, scope, sel)
-	if err != nil {
-		return nil, err
-	}
-	analyzedNode, _, err = analyzeProcedureBodies(ctx, a, analyzedNode, false, scope, sel)
+	analyzedNode, _, err = analyzeProcedureBodies(ctx, a, cp.Procedure, false, scope, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +283,7 @@ func applyProcedures(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scop
 				return nil, transform.SameTree, err
 			}
 			var parsedProcedure sql.Node
-			b, _ := planbuilder.New(ctx, a.Catalog)
+			b := planbuilder.New(ctx, a.Catalog)
 			b.SetParserOptions(sql.NewSqlModeFromString(procedure.SqlMode).ParserOptions())
 			if call.AsOf() != nil {
 				asOf, err := call.AsOf().Eval(ctx, nil)
@@ -297,7 +293,6 @@ func applyProcedures(ctx *sql.Context, a *Analyzer, n sql.Node, scope *plan.Scop
 				b.ProcCtx().AsOf = asOf
 			}
 			b.ProcCtx().DbName = call.Database().Name()
-
 			parsedProcedure, _, _, err = b.Parse(procedure.CreateStatement, false)
 			if err != nil {
 				return nil, transform.SameTree, err

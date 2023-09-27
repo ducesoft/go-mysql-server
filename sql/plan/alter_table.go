@@ -55,6 +55,10 @@ func (r *RenameTable) String() string {
 	return fmt.Sprintf("Rename table %s to %s", r.OldNames, r.NewNames)
 }
 
+func (r *RenameTable) IsReadOnly() bool {
+	return false
+}
+
 func (r *RenameTable) RowIter(ctx *sql.Context, row sql.Row) (sql.RowIter, error) {
 	renamer, _ := r.Db.(sql.TableRenamer)
 	viewDb, _ := r.Db.(sql.ViewDatabase)
@@ -263,6 +267,10 @@ func (a *AddColumn) Order() *sql.ColumnOrder {
 	return a.order
 }
 
+func (a *AddColumn) IsReadOnly() bool {
+	return false
+}
+
 func (a *AddColumn) WithDatabase(db sql.Database) (sql.Node, error) {
 	na := *a
 	na.Db = db
@@ -279,7 +287,7 @@ func (a *AddColumn) String() string {
 }
 
 func (a *AddColumn) Expressions() []sql.Expression {
-	return append(transform.WrappedColumnDefaults(a.targetSch), expression.WrapExpressions(a.column.Default)...)
+	return append(transform.WrappedColumnDefaults(a.targetSch), transform.WrappedColumnDefaults(sql.Schema{a.column})...)
 }
 
 func (a AddColumn) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
@@ -287,17 +295,21 @@ func (a AddColumn) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
 		return nil, sql.ErrInvalidChildrenNumber.New(a, len(exprs), 1+len(a.targetSch))
 	}
 
-	a.targetSch = transform.SchemaWithDefaults(a.targetSch, exprs[:len(a.targetSch)])
+	sch, err := transform.SchemaWithDefaults(a.targetSch, exprs[:len(a.targetSch)])
+	if err != nil {
+		return nil, err
+	}
 
-	unwrappedColDefVal, ok := exprs[len(exprs)-1].(*expression.Wrapper).Unwrap().(*sql.ColumnDefaultValue)
+	a.targetSch = sch
+
+	colSchema := sql.Schema{a.column}
+	colSchema, err = transform.SchemaWithDefaults(colSchema, exprs[len(exprs)-1:])
+	if err != nil {
+		return nil, err
+	}
 
 	// *sql.Column is a reference type, make a copy before we modify it so we don't affect the original node
-	a.column = a.column.Copy()
-	if ok {
-		a.column.Default = unwrappedColDefVal
-	} else { // nil fails type check
-		a.column.Default = nil
-	}
+	a.column = colSchema[0]
 	return &a, nil
 }
 
@@ -415,6 +427,9 @@ func (c ColDefaultExpression) WithChildren(children ...sql.Expression) (sql.Expr
 
 func (c ColDefaultExpression) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	columnDefaultExpr := c.Column.Default
+	if columnDefaultExpr == nil {
+		columnDefaultExpr = c.Column.Generated
+	}
 
 	if columnDefaultExpr == nil && !c.Column.Nullable {
 		val := c.Column.Type.Zero()
@@ -436,13 +451,14 @@ type DropColumn struct {
 	ddlNode
 	Table        sql.Node
 	Column       string
-	Checks       sql.CheckConstraints
+	checks       sql.CheckConstraints
 	targetSchema sql.Schema
 }
 
 var _ sql.Node = (*DropColumn)(nil)
 var _ sql.Databaser = (*DropColumn)(nil)
 var _ sql.SchemaTarget = (*DropColumn)(nil)
+var _ sql.CheckConstraintNode = (*DropColumn)(nil)
 var _ sql.CollationCoercible = (*DropColumn)(nil)
 
 func NewDropColumnResolved(table *ResolvedTable, column string) *DropColumn {
@@ -461,6 +477,16 @@ func NewDropColumn(database sql.Database, table *UnresolvedTable, column string)
 	}
 }
 
+func (d *DropColumn) Checks() sql.CheckConstraints {
+	return d.checks
+}
+
+func (d *DropColumn) WithChecks(checks sql.CheckConstraints) sql.Node {
+	ret := *d
+	ret.checks = checks
+	return &ret
+}
+
 func (d *DropColumn) WithDatabase(db sql.Database) (sql.Node, error) {
 	nd := *d
 	nd.Db = db
@@ -469,6 +495,10 @@ func (d *DropColumn) WithDatabase(db sql.Database) (sql.Node, error) {
 
 func (d *DropColumn) String() string {
 	return fmt.Sprintf("drop column %s", d.Column)
+}
+
+func (d *DropColumn) IsReadOnly() bool {
+	return false
 }
 
 // Validate returns an error if this drop column operation is invalid (because it would invalidate a column default
@@ -578,7 +608,12 @@ func (d DropColumn) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
 		return nil, sql.ErrInvalidChildrenNumber.New(d, len(exprs), len(d.targetSchema))
 	}
 
-	d.targetSchema = transform.SchemaWithDefaults(d.targetSchema, exprs)
+	sch, err := transform.SchemaWithDefaults(d.targetSchema, exprs)
+	if err != nil {
+		return nil, err
+	}
+	d.targetSchema = sch
+
 	return &d, nil
 }
 
@@ -587,13 +622,14 @@ type RenameColumn struct {
 	Table         sql.Node
 	ColumnName    string
 	NewColumnName string
-	Checks        sql.CheckConstraints
+	checks        sql.CheckConstraints
 	targetSchema  sql.Schema
 }
 
 var _ sql.Node = (*RenameColumn)(nil)
 var _ sql.Databaser = (*RenameColumn)(nil)
 var _ sql.SchemaTarget = (*RenameColumn)(nil)
+var _ sql.CheckConstraintNode = (*RenameColumn)(nil)
 var _ sql.CollationCoercible = (*RenameColumn)(nil)
 
 func NewRenameColumnResolved(table *ResolvedTable, columnName string, newColumnName string) *RenameColumn {
@@ -614,6 +650,16 @@ func NewRenameColumn(database sql.Database, table *UnresolvedTable, columnName s
 	}
 }
 
+func (r *RenameColumn) Checks() sql.CheckConstraints {
+	return r.checks
+}
+
+func (r *RenameColumn) WithChecks(checks sql.CheckConstraints) sql.Node {
+	ret := *r
+	ret.checks = checks
+	return &ret
+}
+
 func (r *RenameColumn) WithDatabase(db sql.Database) (sql.Node, error) {
 	nr := *r
 	nr.Db = db
@@ -631,6 +677,10 @@ func (r *RenameColumn) TargetSchema() sql.Schema {
 
 func (r *RenameColumn) String() string {
 	return fmt.Sprintf("rename column %s to %s", r.ColumnName, r.NewColumnName)
+}
+
+func (r *RenameColumn) IsReadOnly() bool {
+	return false
 }
 
 func (r *RenameColumn) DebugString() string {
@@ -663,7 +713,12 @@ func (r RenameColumn) WithExpressions(exprs ...sql.Expression) (sql.Node, error)
 		return nil, sql.ErrInvalidChildrenNumber.New(r, len(exprs), len(r.targetSchema))
 	}
 
-	r.targetSchema = transform.SchemaWithDefaults(r.targetSchema, exprs)
+	sch, err := transform.SchemaWithDefaults(r.targetSchema, exprs)
+	if err != nil {
+		return nil, err
+	}
+
+	r.targetSchema = sch
 	return &r, nil
 }
 
@@ -754,6 +809,10 @@ func (m *ModifyColumn) String() string {
 	return fmt.Sprintf("modify column %s", m.column.Name)
 }
 
+func (m *ModifyColumn) IsReadOnly() bool {
+	return false
+}
+
 func (m ModifyColumn) WithTargetSchema(schema sql.Schema) (sql.Node, error) {
 	m.targetSchema = schema
 	return &m, nil
@@ -795,7 +854,11 @@ func (m ModifyColumn) WithExpressions(exprs ...sql.Expression) (sql.Node, error)
 		return nil, sql.ErrInvalidChildrenNumber.New(m, len(exprs), 1+len(m.targetSchema))
 	}
 
-	m.targetSchema = transform.SchemaWithDefaults(m.targetSchema, exprs[:len(m.targetSchema)])
+	sch, err := transform.SchemaWithDefaults(m.targetSchema, exprs[:len(m.targetSchema)])
+	if err != nil {
+		return nil, err
+	}
+	m.targetSchema = sch
 
 	unwrappedColDefVal, ok := exprs[len(exprs)-1].(*expression.Wrapper).Unwrap().(*sql.ColumnDefaultValue)
 	if ok {
@@ -892,6 +955,10 @@ func (atc *AlterTableCollation) WithDatabase(db sql.Database) (sql.Node, error) 
 	natc := *atc
 	natc.Db = db
 	return &natc, nil
+}
+
+func (atc *AlterTableCollation) IsReadOnly() bool {
+	return false
 }
 
 // String implements the interface sql.Node.
