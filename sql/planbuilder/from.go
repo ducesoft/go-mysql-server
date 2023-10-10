@@ -204,11 +204,11 @@ func (b *Builder) buildUsingJoin(inScope, leftScope, rightScope *scope, te *ast.
 	for _, col := range te.Condition.Using {
 		colName := col.String()
 		// Every column in the USING clause must be in both tables.
-		lCol, ok := left.resolveColumn("", colName, false)
+		lCol, ok := left.resolveColumn("", "", colName, false)
 		if !ok {
 			b.handleErr(sql.ErrUnknownColumn.New(colName, "from clause"))
 		}
-		rCol, ok := right.resolveColumn("", colName, false)
+		rCol, ok := right.resolveColumn("", "", colName, false)
 		if !ok {
 			b.handleErr(sql.ErrUnknownColumn.New(colName, "from clause"))
 		}
@@ -748,6 +748,12 @@ func (b *Builder) resolveView(name string, database sql.Database, asOf interface
 			b.parserOpts = sql.NewSqlModeFromString(viewDef.SqlMode).ParserOptions()
 			node, _, _, err := b.Parse(viewDef.TextDefinition, false)
 			if err != nil {
+				// TODO: Need to account for non-existing functions or
+				//  users without appropriate privilege to the referenced table/column/function.
+				if sql.ErrTableNotFound.Is(err) || sql.ErrColumnNotFound.Is(err) {
+					// TODO: ALTER VIEW should not return this error
+					err = sql.ErrInvalidRefInView.New(database.Name(), name)
+				}
 				b.handleErr(err)
 			}
 			view = plan.NewSubqueryAlias(name, viewDef.TextDefinition, node).AsView(viewDef.CreateViewStatement)
