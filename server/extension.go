@@ -16,10 +16,12 @@ package server
 
 import (
 	sqle "github.com/dolthub/go-mysql-server"
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/vitess/go/mysql"
 	"github.com/dolthub/vitess/go/sqltypes"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
+	"go.opentelemetry.io/otel/trace"
 	"sort"
 )
 
@@ -163,4 +165,24 @@ func (ih *interceptorHandler) ComResetConnection(c *mysql.Conn) {
 
 func (ih *interceptorHandler) ParserOptionsForConnection(c *mysql.Conn) (ast.ParserOptions, error) {
 	return ih.h.ParserOptionsForConnection(c)
+}
+
+func NewHandler(cfg Config, e *sqle.Engine, sb SessionBuilder) mysql.Handler {
+	var tracer trace.Tracer
+	if cfg.Tracer != nil {
+		tracer = cfg.Tracer
+	} else {
+		tracer = sql.NoopTracer
+	}
+
+	sm := NewSessionManager(sb, tracer, e.Analyzer.Catalog.Database, e.MemoryManager, e.ProcessList, cfg.Address)
+	return &Handler{
+		e:                 e,
+		sm:                sm,
+		readTimeout:       cfg.ConnReadTimeout,
+		disableMultiStmts: cfg.DisableClientMultiStatements,
+		maxLoggedQueryLen: cfg.MaxLoggedQueryLen,
+		encodeLoggedQuery: cfg.EncodeLoggedQuery,
+		sel:               nil,
+	}
 }
