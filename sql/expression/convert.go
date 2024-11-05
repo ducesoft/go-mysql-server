@@ -349,7 +349,7 @@ func convertValue(val interface{}, castTo string, originType sql.Type, typeLengt
 		}
 		d, _, err := types.Float64.Convert(value)
 		if err != nil {
-			return types.Float64.Zero(), nil
+			return types.Float64.Zero(), err
 		}
 		return d, nil
 	case ConvertToJSON:
