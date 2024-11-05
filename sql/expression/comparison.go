@@ -128,6 +128,9 @@ func (c *comparison) Compare(ctx *sql.Context, row sql.Row) (int, error) {
 	}
 	if compareType == nil {
 		left, right, compareType, err = c.castLeftAndRight(left, right)
+		if IsNAN(left, right) {
+			return -2, nil
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -751,3 +754,17 @@ var (
 	// operand in an IN operator.
 	ErrUnsupportedInOperand = errors.NewKind("right operand in IN operation must be tuple, but is %T")
 )
+
+func IsNAN(left, right interface{}) bool {
+	if va, ok := left.(string); ok {
+		if va == "NAN" {
+			return true
+		}
+	}
+	if va, ok := right.(string); ok {
+		if va == "NAN" {
+			return true
+		}
+	}
+	return false
+}
