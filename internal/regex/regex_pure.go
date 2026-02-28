@@ -1,4 +1,4 @@
-//go:build gms_pure_go
+//go:build !gms_c
 
 package regex
 
